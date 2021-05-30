@@ -15,10 +15,11 @@ use qt_widgets::{
     QVBoxLayout, QWidget,
 };
 use qt_widgets::{cpp_core::Ptr, q_layout::SizeConstraint, QLabel};
-use rustfft::{Fft, FftPlanner, num_complex::Complex64};
+// use realfft::{RealFftPlanner, RealToComplex, num_complex::Complex64};
+use rustfft::{num_complex::Complex64, Fft, FftPlanner};
 use soapysdr::{Args, Device};
-use worker::{FinishedMaybe, Worker};
 use std::{borrow::Borrow, cell::RefCell, f64::consts::FRAC_PI_2, ops::Range, rc::Rc, sync::Arc};
+use worker::{FinishedMaybe, Worker};
 
 const SAMPLE_COUNT: usize = 256;
 
@@ -42,9 +43,8 @@ impl Radio {
                 (1..=n).into_iter().map(|i| (i as f64 * f).sin()).sum()
             }
             let i = i as f64 * 0.2;
-            let n = 3;
-            let r = sin_sum(n, i);
-            // let i = sin_sum(n, i + FRAC_PI_2);
+            let r = sin_sum(6, i) * 0.5;
+
             *s = Complex64::new(r, 0.0);
         }
     }
@@ -312,6 +312,7 @@ impl ShittySpectogram {
         );
         new_image.fill_uint(0);
         self.history_image = new_image;
+        self.recreate_image = false;
     }
 
     unsafe fn add_new_data(
@@ -329,13 +330,12 @@ impl ShittySpectogram {
         let is_spectogram = self.spectogram_history_count != 0;
 
         if is_spectogram {
-            let row = self.history_image.scan_line_mut(0) as *mut u32;
-
             if self.recreate_image {
                 self.recreate_image();
             } else {
                 // shift image data one row down
                 let samples = self.frequency_samples as usize;
+                let row = self.history_image.scan_line_mut(0) as *mut u32;
                 std::ptr::copy(
                     row,
                     row.add(samples),
@@ -343,6 +343,7 @@ impl ShittySpectogram {
                 );
             }
 
+            let row = self.history_image.scan_line_mut(0) as *mut u32;
             for (i, p) in data.enumerate() {
                 self.series.append_2_double(d_x * i as f64, p);
 
@@ -366,7 +367,7 @@ struct App {
     v_layout: QBox<QVBoxLayout>,
     spectogram: ShittySpectogram,
     graph: ShittySpectogram,
-    worker: Worker
+    worker: Worker,
 }
 
 impl App {
@@ -389,7 +390,7 @@ impl App {
 
         let spectogram = {
             let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 40, 0.0..1.0, -10.0..50.0);
+                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 40, 0.0..1.0, -10.0..150.0);
 
             let layout = QVBoxLayout::new_0a();
             layout.add_widget(widget);
@@ -406,7 +407,7 @@ impl App {
 
         let graph = {
             let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 0, -1.0..1.0, -1.5..1.5);
+                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 0, 0.0..1.0, -1.5..1.5);
 
             let layout = QVBoxLayout::new_0a();
             layout.add_widget(widget);
@@ -431,21 +432,22 @@ impl App {
             spectogram,
             graph,
             v_layout,
-            worker: Worker::new()
+            worker: Worker::new(),
         }
     }
 }
 
 struct FftData {
     fft: Arc<dyn Fft<f64>>,
-    input: Box<[Complex64]>, 
-    output: Box<[Complex64]>, 
-    scratch: Box<[Complex64]>
+    input: Box<[Complex64]>,
+    output: Box<[Complex64]>,
+    scratch: Box<[Complex64]>,
 }
 
 impl FftData {
     fn new(len: usize) -> Self {
         let fft = FftPlanner::new().plan_fft_forward(len);
+        // let scratch = fft.get_outofplace_scratch_len();
         let scratch = fft.get_outofplace_scratch_len();
 
         let input = vec![Default::default(); len].into_boxed_slice();
@@ -457,14 +459,24 @@ impl FftData {
             input,
             output,
             scratch,
-        }        
+        }
     }
-    fn get_input(&self) -> &[Complex64] {&self.input}
-    fn get_input_mut(&mut self) -> &mut [Complex64] {&mut self.input}
-    fn get_output(&self) -> &[Complex64] {&self.output}
+    fn get_input(&self) -> &[Complex64] {
+        &self.input
+    }
+    fn get_input_mut(&mut self) -> &mut [Complex64] {
+        &mut self.input
+    }
+    fn get_output(&self) -> &[Complex64] {
+        &self.output
+    }
 
     fn process(&mut self) {
-        self.fft.process_outofplace_with_scratch(&mut self.input, &mut self.output, &mut self.scratch);
+        self.fft.process_outofplace_with_scratch(
+            &mut self.input,
+            &mut self.output,
+            &mut self.scratch,
+        );
     }
 }
 
@@ -479,7 +491,7 @@ impl Clone for FftData {
             input,
             output,
             scratch,
-        }        
+        }
     }
 }
 
@@ -496,9 +508,8 @@ fn main() {
         let mut task: Option<FinishedMaybe<FftData>> = None;
 
         timer.timeout().connect(&SlotNoArgs::new(&timer, move || {
-
             unsafe fn color(f: f64) -> CppBox<QColor> {
-                QColor::from_rgb_f_3a(f, 0.0, 0.0)
+                QColor::from_rgb_f_3a(f.ln() * 0.2, 0.0, 0.0)
             };
 
             let mut finished_task = None;
@@ -507,7 +518,7 @@ fn main() {
                 match task.poll().ok().unwrap() {
                     worker::Poll::Ready(t) => finished_task = Some(t),
                     worker::Poll::Pending => (),
-                    _ => unimplemented!()
+                    _ => unimplemented!(),
                 }
             };
 
@@ -517,20 +528,26 @@ fn main() {
 
                 app.device.radio.borrow_mut().get_data(fft.get_input_mut());
 
-                let new_task = app.worker.add_work(move || {
-                    fft.process();
+                let new_task = app
+                    .worker
+                    .add_work(move || {
+                        fft.process();
 
-                    fft
-                }).ok().unwrap();
+                        fft
+                    })
+                    .ok()
+                    .unwrap();
 
                 task = Some(new_task);
             }
-            
-            if let Some(finished) = finished_task.take() {
 
-                let iter = finished.get_output().iter().map(|c| /* (c.re * c.re + c.im * c.im).sqrt() */c.re);
+            if let Some(finished) = finished_task.take() {
+                let iter = finished
+                    .get_output()
+                    .iter()
+                    .map(|c| (c.re * c.re + c.im * c.im).sqrt()).take(SAMPLE_COUNT/2+1);
                 app.spectogram.add_new_data(iter, color);
-                
+
                 let iter = finished.get_input().iter().map(|c| c.re);
                 app.graph.add_new_data(iter, color);
 

@@ -1,4 +1,10 @@
-use std::{any::Any, marker::PhantomData, ops::DerefMut, sync::{Arc, Mutex, atomic::AtomicBool}, thread::{self, JoinHandle}};
+use std::{
+    any::Any,
+    marker::PhantomData,
+    ops::DerefMut,
+    sync::{atomic::AtomicBool, Arc, Mutex},
+    thread::{self, JoinHandle},
+};
 
 pub struct WorkerPoisoned;
 pub enum Poll<T> {
@@ -32,7 +38,7 @@ enum Work {
 pub struct FinishedMaybe<T: Send + 'static> {
     _marker: PhantomData<T>,
     // the mutex could be replaced with an atomic cell
-    work: Option<Arc<Mutex<Work>>>
+    work: Option<Arc<Mutex<Work>>>,
 }
 
 unsafe impl<T: Send + 'static> Send for FinishedMaybe<T> {}
@@ -69,7 +75,7 @@ impl<T: Send + 'static> FinishedMaybe<T> {
 pub struct Worker {
     thread: Option<JoinHandle<()>>,
     queue: Arc<Mutex<Vec<Arc<Mutex<Work>>>>>,
-    stop: Arc<AtomicBool>
+    stop: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -109,14 +115,16 @@ impl Worker {
                         Work::Ready(task.process())
                     }
                 };
-
-                let old = std::mem::replace(guard.deref_mut(), output);
                 // the previous value was ptr::read so it must be unsured that the original memory isn't dropped
-                std::mem::forget(old);
+                unsafe { std::ptr::write(guard.deref_mut(), output) }
             })
             .unwrap();
 
-        Self { thread: Some(thread), queue, stop }
+        Self {
+            thread: Some(thread),
+            queue,
+            stop,
+        }
     }
     pub fn add_work<T: Send + 'static>(
         &mut self,
@@ -143,6 +151,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         // I hope the ordering is correct
         self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.thread.as_ref().unwrap().thread().unpark();
         // this is apparently named the Option dance
         self.thread.take().unwrap().join();
     }
