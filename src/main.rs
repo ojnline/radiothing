@@ -1,4 +1,3 @@
-// #![windows_subsystem = "linux"]
 #![allow(unused)]
 
 mod worker;
@@ -16,11 +15,12 @@ use qt_widgets::{
     QVBoxLayout, QWidget,
 };
 use qt_widgets::{cpp_core::Ptr, q_layout::SizeConstraint, QLabel};
-use rustfft::num_complex::Complex64;
+use rustfft::{Fft, FftPlanner, num_complex::Complex64};
 use soapysdr::{Args, Device};
-use std::{borrow::Borrow, cell::RefCell, f64::consts::FRAC_PI_2, ops::Range, rc::Rc};
+use worker::{FinishedMaybe, Worker};
+use std::{borrow::Borrow, cell::RefCell, f64::consts::FRAC_PI_2, ops::Range, rc::Rc, sync::Arc};
 
-const SAMPLE_WINDOW: usize = 64;
+const SAMPLE_COUNT: usize = 256;
 
 struct Radio {
     device: Option<Device>,
@@ -35,12 +35,6 @@ impl Radio {
         }
     }
 
-    // fn init_stream(&mut self, samplerate: usize) {
-    //     if let Some(device) = self.device.as_ref() {
-    //         device.
-    //     }
-    // }
-
     fn get_data(&mut self, buffer: &mut [Complex64]) {
         for (i, s) in buffer.iter_mut().enumerate() {
             // s.re = (i as f64 * 5.0).sin()
@@ -50,8 +44,8 @@ impl Radio {
             let i = i as f64 * 0.2;
             let n = 3;
             let r = sin_sum(n, i);
-            let i = sin_sum(n, i + FRAC_PI_2);
-            *s = Complex64::new(r, i);
+            // let i = sin_sum(n, i + FRAC_PI_2);
+            *s = Complex64::new(r, 0.0);
         }
     }
 }
@@ -97,13 +91,7 @@ impl DeviceGroup {
         layout.add_widget(&combo_box);
         layout.add_widget(&row_widget);
 
-        // layout.add_spacing(50);
-
         layout.set_size_constraint(SizeConstraint::SetFixedSize);
-        // layout.set_direction(Direction::Down);
-        // layout.set_alignment_q_layout_q_flags_alignment_flag(&layout, AlignmentFlag::AlignTop.into());
-        // layout.add_stretch_0a();
-        // layout.ali
 
         let ptr = group.as_ptr();
 
@@ -224,10 +212,6 @@ impl ShittySpectogram {
         layout.set_spacing(0);
         layout.set_margin(0);
 
-        // let group = QGroupBox::new();
-        // group.set_title(&qs("Graph"));
-        // group.set_layout(&layout);
-
         let widget = QWidget::new_0a();
         widget.set_size_policy_2a(Policy::Fixed, Policy::Fixed);
         widget.set_layout(&layout);
@@ -238,7 +222,6 @@ impl ShittySpectogram {
         x_axis.set_range(x_range.start, x_range.end);
         let y_axis = QValueAxis::new_0a();
         y_axis.set_range(y_range.start, y_range.end);
-        // y_axis.set_visible_1a(false);
         y_axis.set_label_format(&qs(" "));
 
         chart.add_axis(&x_axis, AlignmentFlag::AlignTop.into());
@@ -260,12 +243,6 @@ impl ShittySpectogram {
         let graph_width_i = graph_width as i32;
         let graph_height_i = graph_height as i32;
 
-        // chart.set_plot_area(&QRectF::from_4_double(25.0, 25.0, 400.0, 300.0));
-        // let margin = layout.spacing();
-        // let margin = chart.margins().left();
-        // let x_space = chart.margins().left() as f64;
-        // let bottom_padding = 0.0;
-        // let x_space = margin as f64;
         let y_space = 20.0;
         chart.set_plot_area(&QRectF::from_4_double(
             0.0,
@@ -274,31 +251,11 @@ impl ShittySpectogram {
             graph_height_f, /* - bottom_padding */
         ));
 
-        // let m = chart.margins().left();
-        // m.set_left(0);
-        // m.set_bottom(0);
-        // chart.set_margins(&m);
-        // chart.set_contents_margins_4a(0.0, 0.0, 0.0, 0.0);
-        // let g = chart.plot_area();
-        // chart.set_plot_area(&QRectF::from_4_double(g.left(), g.right(), 400.0, 300.0));
-
         let chart_view = QChartView::from_q_chart(&chart);
         chart_view.set_render_hint_1a(RenderHint::Antialiasing);
-        // chart_view.resize_2a(graph_width_i + margin, graph_height_i+y_space as i32);
         chart_view.set_minimum_size_2a(graph_width_i, graph_height_i + y_space as i32);
-        // chart_view.set_contents_margins_4a(margin, margin, margin, 0);
         chart.set_background_roundness(0.0);
-        // chart_view.set_maximum_size_2a(400, 300);
-        // chart_view.set_window_title(&qs("Charts example"));
-        // chart_view.as_ptr().static_upcast::<QWidget>()
-        // chart_view.set_background_role(ColorRole::Dark);
-
         layout.add_widget(&chart_view);
-
-        // chart_view.set_size_policy_2a(Policy::Minimum, Policy::Minimum);
-        // let margins = chart_view.contents_margins();
-        // margins.set_bottom(0);
-        // chart_view.set_contents_margins_1a(&margins);
 
         let pixmap = QPixmap::from_2_int(frequency_samples as i32, spectogram_history_count as i32); // from_q_string(&qs("./bbb.jpg"));
         pixmap.fill_1a(&QColor::from_rgb_3a(0, 0, 0));
@@ -309,18 +266,6 @@ impl ShittySpectogram {
         pixlabel.set_scaled_contents(true);
         pixlabel.set_fixed_width(graph_width_i);
         layout.add_widget(&pixlabel);
-
-        // let margins = label.contents_margins();
-        // margins.set_top(0);
-        // label.set_contents_margins_1a(&margins);
-
-        // chart.set_contents_margins_4a(0.0, 0.0, 0.0, 0.0);
-        // let margin = layout.margin();
-
-        // layout.set_size_constraint(SizeConstraint::SetFixedSize);
-        // layout.add_stretch_0a();
-
-        // layout.set_contents_margins_4a(margin, -bottom_padding as i32, margin, 0);
 
         let history_image = QImage::from_2_int_format(
             frequency_samples as i32,
@@ -413,79 +358,7 @@ impl ShittySpectogram {
             }
         }
     }
-    // unsafe fn set_new_data(self: &Rc<Self>, data: impl ExactSizeIterator<Item = f64>) {
-    //     self.series.clear();
-
-    //     // let width = self.view.width();
-
-    //     let d_x = 1.0 / (data.len() as f64);
-
-    //     let mut x = 0.0;
-    //     for p in data {
-    //         self.series.append_2_double(x, p);
-    //         x += d_x;
-    //     }
-    // }
 }
-
-// struct WipSpectogram {
-//     scene: QBox<QGraphicsScene>,
-//     view: QBox<QGraphicsView>
-// }
-
-// impl WipSpectogram {
-//     unsafe fn new() -> (Rc<Self>, Ptr<QGraphicsView>) {
-//         let scene = QGraphicsScene::new();
-
-//         // scene.set_scene_rect_4a(-100, , w, h);
-//         // let pen = QPen::new();
-//         // pen.set_color(&QColor::from_3_int(0, 0, 0));
-//         // scene.add_line_5a(0.0, 0.0, 20.0, 20.0, &pen);
-//         // let text = scene.add_text_1a(&qs("Ass"));
-//         // QGraphicsTextItem::static_upcast(text.as_ptr());
-//         // text.as_ptr().static_upcast::<QGraphicsItem>().set_pos_2a(0.0, 0.0);
-//         // // scene.add_line_4a(20.0, 50.0, 50.0, 200.0);
-//         // // scene.add_rect_4a(100.0, 50.0, 60.0, 80.0);
-//         // scene.add_ellipse_4a(200.0, 100.0, 80.0, 80.0);
-
-//         let green = QBrush::from_global_color(GlobalColor::Green);
-//         let blue = QBrush::from_global_color(GlobalColor::Blue);
-//         let outline = QPen::from_q_color(&QColor::from_3_int(0, 0, 0));
-//         outline.set_width(2);
-
-//         let rectangle = scene.add_rect_6a(100.0, 0.0, 80.0, 100.0, &outline, &blue);
-
-//         // addEllipse(x,y,w,h,pen,brush)
-//         let ellipse = scene.add_ellipse_6a(0.0, 0.0, 20.0, 20.0, &outline, &green);
-
-//         let text = scene.add_text_2a(&qs("Ass"), &QFont::from_q_string_int(&qs("Arial"), 20) );
-//         // movable text
-//         // text.as_ptr().static_upcast::<QGraphicsItem>().set_flag_1a(GraphicsItemFlag::ItemIsMovable);
-
-//         let view = QGraphicsView::from_q_graphics_scene(&scene);
-//         // view.set_focus_policy(FocusPolicy::NoFocus);
-
-//         // view.set_minimum_size_2a(400, 300);
-//         view.set_scene_rect_1a(&scene.items_bounding_rect());
-//         scene.set_scene_rect_4a(0.0, 0.0, 400.0, 400.0);
-//         // let g = view.map_to_scene_q_rect(&view.rect()).bounding_rect();
-//         // scene.set_scene_rect_1a(&g);
-//         // view.set_scene_rect_1a(&g);
-//         // view.ensure_visible_q_rect_f(&g);
-//         // view.set
-
-//         std::mem::forget(green);
-//         std::mem::forget(blue);
-//         std::mem::forget(outline);
-//         let ptr = view.as_ptr();
-//         let s = Rc::new(Self{
-//             scene,
-//             view
-//         });
-
-//         (s, ptr)
-//     }
-// }
 
 struct App {
     root: QBox<QWidget>,
@@ -493,6 +366,7 @@ struct App {
     v_layout: QBox<QVBoxLayout>,
     spectogram: ShittySpectogram,
     graph: ShittySpectogram,
+    worker: Worker
 }
 
 impl App {
@@ -515,7 +389,7 @@ impl App {
 
         let spectogram = {
             let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_WINDOW as u32, 40, 0.0..1.0, -10.0..50.0);
+                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 40, 0.0..1.0, -10.0..50.0);
 
             let layout = QVBoxLayout::new_0a();
             layout.add_widget(widget);
@@ -532,7 +406,7 @@ impl App {
 
         let graph = {
             let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_WINDOW as u32, 0, 0.0..0.1, -1.2..1.2);
+                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 0, -1.0..1.0, -1.5..1.5);
 
             let layout = QVBoxLayout::new_0a();
             layout.add_widget(widget);
@@ -557,7 +431,55 @@ impl App {
             spectogram,
             graph,
             v_layout,
+            worker: Worker::new()
         }
+    }
+}
+
+struct FftData {
+    fft: Arc<dyn Fft<f64>>,
+    input: Box<[Complex64]>, 
+    output: Box<[Complex64]>, 
+    scratch: Box<[Complex64]>
+}
+
+impl FftData {
+    fn new(len: usize) -> Self {
+        let fft = FftPlanner::new().plan_fft_forward(len);
+        let scratch = fft.get_outofplace_scratch_len();
+
+        let input = vec![Default::default(); len].into_boxed_slice();
+        let output = vec![Default::default(); len].into_boxed_slice();
+        let scratch = vec![Default::default(); scratch].into_boxed_slice();
+
+        Self {
+            fft,
+            input,
+            output,
+            scratch,
+        }        
+    }
+    fn get_input(&self) -> &[Complex64] {&self.input}
+    fn get_input_mut(&mut self) -> &mut [Complex64] {&mut self.input}
+    fn get_output(&self) -> &[Complex64] {&self.output}
+
+    fn process(&mut self) {
+        self.fft.process_outofplace_with_scratch(&mut self.input, &mut self.output, &mut self.scratch);
+    }
+}
+
+impl Clone for FftData {
+    fn clone(&self) -> Self {
+        let input = vec![Default::default(); self.input.len()].into_boxed_slice();
+        let output = vec![Default::default(); self.output.len()].into_boxed_slice();
+        let scratch = vec![Default::default(); self.scratch.len()].into_boxed_slice();
+
+        Self {
+            fft: self.fft.clone(),
+            input,
+            output,
+            scratch,
+        }        
     }
 }
 
@@ -569,47 +491,54 @@ fn main() {
         let mut a: f64 = 1.0;
         timer.set_interval(50);
         let start = std::time::Instant::now();
+
+        let mut fft = None;
+        let mut task: Option<FinishedMaybe<FftData>> = None;
+
         timer.timeout().connect(&SlotNoArgs::new(&timer, move || {
-            // let mut hasher = DefaultHasher::new();
-            // std::time::Instant::now().elapsed().hash(&mut hasher);
-            // let seed = hasher.finish() as f64;
-            // let offset = start.elapsed().as_secs_f64();
 
             unsafe fn color(f: f64) -> CppBox<QColor> {
                 QColor::from_rgb_f_3a(f, 0.0, 0.0)
             };
 
-            // let data = (0..64)
-            //     .into_iter()
-            //     .map(|i| {
-            //         a += 0.001;
+            let mut finished_task = None;
 
-            //         if !a.is_finite() {
-            //             a = 1.0;
-            //         }
+            if let Some(task) = &mut task {
+                match task.poll().ok().unwrap() {
+                    worker::Poll::Ready(t) => finished_task = Some(t),
+                    worker::Poll::Pending => (),
+                    _ => unimplemented!()
+                }
+            };
 
-            //         // (i as f64) / 256.0
-            //         ((i as f64) * seed % 5.0).sin()
-            //         // (offset * 3.0 + (i as f64) / 10.0).sin()
-            //     })
-            //     .collect::<Vec<_>>();
-            let mut data = Box::new([Complex64::new(0.0, 0.0); SAMPLE_WINDOW]);
-            app.device.radio.borrow_mut().get_data(&mut *data);
+            if finished_task.is_some() || task.is_none() {
+                let new_fft = || FftData::new(SAMPLE_COUNT);
+                let mut fft = fft.take().unwrap_or_else(new_fft);
 
-            let iter = data.iter().map(|c| c.re);
-            app.graph.add_new_data(iter, color);
+                app.device.radio.borrow_mut().get_data(fft.get_input_mut());
 
-            use rustfft::Fft;
-            let fft = rustfft::FftPlanner::new().plan_fft_forward(SAMPLE_WINDOW);
-            fft.process(&mut *data);
+                let new_task = app.worker.add_work(move || {
+                    fft.process();
 
-            let iter = data.iter().map(|c| (c.re * c.re + c.im * c.im).sqrt().ln());
+                    fft
+                }).ok().unwrap();
 
-            app.spectogram.add_new_data(iter, color);
-            // spectogram.add_new_data(data, color);
+                task = Some(new_task);
+            }
+            
+            if let Some(finished) = finished_task.take() {
+
+                let iter = finished.get_output().iter().map(|c| /* (c.re * c.re + c.im * c.im).sqrt() */c.re);
+                app.spectogram.add_new_data(iter, color);
+                
+                let iter = finished.get_input().iter().map(|c| c.re);
+                app.graph.add_new_data(iter, color);
+
+                fft = Some(finished);
+            }
         }));
+
         timer.start_0a();
-        // QApplication::set_style_q_string(&qs("windows"));
         QApplication::exec()
     })
 }

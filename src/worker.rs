@@ -1,10 +1,4 @@
-use std::{
-    any::Any,
-    marker::PhantomData,
-    ops::DerefMut,
-    sync::{Arc, Mutex},
-    thread::{self, JoinHandle},
-};
+use std::{any::Any, marker::PhantomData, ops::DerefMut, sync::{Arc, Mutex, atomic::AtomicBool}, thread::{self, JoinHandle}};
 
 pub struct WorkerPoisoned;
 pub enum Poll<T> {
@@ -17,28 +11,7 @@ pub trait Task: Send + 'static {
     fn process(self) -> Self::Output;
 }
 
-// trait InternalTask: Send + 'static {
-//     fn process(self) -> Box<dyn Any>;
-// }
-
-// impl<O: Send, T: Task<Output=O>> InternalTask for T {
-//     fn process(self) -> Box<dyn Any> {
-//         let output = Task::process(self);
-//         Box::new(output)
-//     }
-// }
-
 struct TypeEraser<T: Task>(T);
-
-// impl<T: Task> Task for TypeEraser<T> {
-//     type Output = Box<dyn Any + Send>;
-//     fn process(self) -> Self::Output {
-//         let output = <T as Task>::process(self.0);
-
-//         Box::new(output)
-//     }
-// }
-// struct _TypeEraser<T: Task>(T);
 
 trait TypeErasedTask: Send + 'static {
     fn process(self: Box<Self>) -> Box<dyn Any + Send>;
@@ -59,7 +32,7 @@ enum Work {
 pub struct FinishedMaybe<T: Send + 'static> {
     _marker: PhantomData<T>,
     // the mutex could be replaced with an atomic cell
-    work: Option<Arc<Mutex<Work>>>,
+    work: Option<Arc<Mutex<Work>>>
 }
 
 unsafe impl<T: Send + 'static> Send for FinishedMaybe<T> {}
@@ -93,19 +66,26 @@ impl<T: Send + 'static> FinishedMaybe<T> {
     }
 }
 
-struct Worker {
-    thread: JoinHandle<()>,
+pub struct Worker {
+    thread: Option<JoinHandle<()>>,
     queue: Arc<Mutex<Vec<Arc<Mutex<Work>>>>>,
+    stop: Arc<AtomicBool>
 }
 
 impl Worker {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let queue: Arc<Mutex<Vec<Arc<Mutex<Work>>>>> = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
 
         let queue_clone = queue.clone();
+        let stop_clone = stop.clone();
         let thread = thread::Builder::new()
             .name("Simple worker".to_string())
             .spawn(move || loop {
+                if stop_clone.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+
                 let next_work = {
                     let mut guard = queue_clone.lock().unwrap();
                     guard.pop()
@@ -136,9 +116,9 @@ impl Worker {
             })
             .unwrap();
 
-        Self { thread, queue }
+        Self { thread: Some(thread), queue, stop }
     }
-    fn add_work<T: Send + 'static>(
+    pub fn add_work<T: Send + 'static>(
         &mut self,
         task: impl Task<Output = T>,
     ) -> Result<FinishedMaybe<T>, WorkerPoisoned> {
@@ -150,12 +130,21 @@ impl Worker {
         guard.push(arc_work.clone());
         drop(guard);
 
-        self.thread.thread().unpark();
+        self.thread.as_ref().unwrap().thread().unpark();
 
         Ok(FinishedMaybe {
             _marker: PhantomData,
             work: Some(arc_work),
         })
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // I hope the ordering is correct
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        // this is apparently named the Option dance
+        self.thread.take().unwrap().join();
     }
 }
 
