@@ -7,13 +7,10 @@ edition = "2018"
 
 [dependencies]
 soapysdr = "0.3.0"
-cpp_core = "0.6.0"
-qt_core = "0.5.0"
-qt_gui = "0.5.0"
 qt_widgets = "0.5.0"
-qt_ui_tools = "0.5.0"
+qt_charts = "0.5.0"
+rustfft = {version = "6.0.1", default-features = false}
+
+# Fix for breaking non-semver changes because the lib is seemingly dead
 syn = "=1.0.57"
 serde = "=1.0.118"
-
-# [patch.crates-io]
-# qt_macros = {git = "https://github.com/davidedelpapa/ritual.git"}
