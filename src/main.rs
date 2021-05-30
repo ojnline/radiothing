@@ -1,7 +1,7 @@
 // #![windows_subsystem = "linux"]
 #![allow(unused)]
 
-// mod worker;
+mod worker;
 
 use qt::QHBoxLayout;
 use qt_charts::{
