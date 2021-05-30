@@ -3,12 +3,7 @@
 mod worker;
 
 use qt::QHBoxLayout;
-use qt_charts::{
-    cpp_core::CppBox,
-    qt_core::{AlignmentFlag, QRectF, QTimer},
-    qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QImage, QPixmap},
-    *,
-};
+use qt_charts::{*, cpp_core::CppBox, qt_core::{AlignmentFlag, QRectF, QTimer}, qt_gui::{QColor, QIcon, QImage, QPixmap, q_image::Format, q_painter::RenderHint}};
 use qt_widgets::{QCheckBox, QDoubleSpinBox, QFormLayout, QSpinBox, qt_core::{qs, QBox, SlotNoArgs}};
 use qt_widgets::{
     self as qt, q_size_policy::Policy, QApplication, QGridLayout, QGroupBox, QPushButton,
@@ -565,6 +560,7 @@ impl Clone for FftData {
 
 fn main() {
     QApplication::init(|_| unsafe {
+        QApplication::set_window_icon(&QIcon::from_q_string(&qs("./window-icon.svg")));
         let mut app = App::new();
         let timer = QTimer::new_0a();
         // let rand = Rc::new(RefCell::new(0.0));
