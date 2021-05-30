@@ -9,9 +9,7 @@ edition = "2018"
 soapysdr = "0.3.0"
 qt_widgets = "0.5.0"
 qt_charts = "0.5.0"
-# microfft = "0.4.0"
 rustfft = {version = "6.0.1", default-features = false}
-# realfft = "2.0.1"
 
 # Fix for breaking non-semver changes because the lib is seemingly dead
 syn = "=1.0.57"

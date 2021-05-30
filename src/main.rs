@@ -9,7 +9,7 @@ use qt_charts::{
     qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QImage, QPixmap},
     *,
 };
-use qt_widgets::qt_core::{qs, QBox, SlotNoArgs};
+use qt_widgets::{QCheckBox, QDoubleSpinBox, QFormLayout, QSpinBox, qt_core::{qs, QBox, SlotNoArgs}};
 use qt_widgets::{
     self as qt, q_size_policy::Policy, QApplication, QGridLayout, QGroupBox, QPushButton,
     QVBoxLayout, QWidget,
@@ -25,6 +25,7 @@ const SAMPLE_COUNT: usize = 256;
 
 struct Radio {
     device: Option<Device>,
+    receive_channel: Option<usize>,
     args: Vec<Args>,
 }
 
@@ -32,10 +33,10 @@ impl Radio {
     fn new() -> Self {
         Self {
             device: None,
+            receive_channel: None,
             args: Vec::new(),
         }
     }
-
     fn get_data(&mut self, buffer: &mut [Complex64]) {
         for (i, s) in buffer.iter_mut().enumerate() {
             // s.re = (i as f64 * 5.0).sin()
@@ -183,6 +184,65 @@ impl DeviceGroup {
     }
 }
 
+struct ReceiveGroup {
+    samplerate: QBox<QDoubleSpinBox>,
+    frequency: QBox<QDoubleSpinBox>,
+    bandwidth: QBox<QSpinBox>,
+    gain: QBox<QDoubleSpinBox>,
+    automatic_gain: QBox<QCheckBox>,
+    automatic_dc_offset: QBox<QCheckBox>,
+    // samplerate: f64,
+    // frequency: f64,
+    // bandwidth: u64,
+    // gain: f64,
+    // automatic_gain: bool,
+    // automatic_dc_offset: bool,
+
+    group: QBox<QGroupBox>
+}
+
+impl ReceiveGroup {
+    unsafe fn new() -> (Rc<Self>, Ptr<QGroupBox>) {
+        let group = QGroupBox::new();
+        group.set_title(&qs("Receive"));
+        
+        let layout = QFormLayout::new_0a();
+        // layout.set_size_constraint(SizeConstraint::SetFixedSize);
+        group.set_layout(&layout);
+        
+        let samplerate = QDoubleSpinBox::new_0a();
+        layout.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
+
+        let frequency = QDoubleSpinBox::new_0a();
+        layout.add_row_q_string_q_widget(&qs("Frequency"), &frequency);
+
+        let bandwidth = QSpinBox::new_0a();
+        layout.add_row_q_string_q_widget(&qs("Bandwidth"), &bandwidth);
+
+        let gain = QDoubleSpinBox::new_0a();
+        layout.add_row_q_string_q_widget(&qs("Gain"), &gain);
+        
+        let automatic_gain = QCheckBox::new();
+        layout.add_row_q_string_q_widget(&qs("Automatic gain"), &automatic_gain);
+       
+        let automatic_dc_offset = QCheckBox::new();
+        layout.add_row_q_string_q_widget(&qs("Automatic DC offset"), &automatic_dc_offset);
+        
+        let ptr = group.as_ptr();
+        let s = Rc::new(Self{
+            samplerate,
+            frequency,
+            bandwidth,
+            gain,
+            automatic_gain,
+            automatic_dc_offset,
+            group,
+        });
+
+        (s, ptr)
+    }
+}
+
 struct ShittySpectogram {
     graph_width: u32,
     graph_height: u32,
@@ -209,11 +269,12 @@ impl ShittySpectogram {
     ) -> (Self, Ptr<QWidget>) {
         let layout = QVBoxLayout::new_0a();
         let margin = layout.margin();
+        layout.set_size_constraint(SizeConstraint::SetMaximumSize);
         layout.set_spacing(0);
         layout.set_margin(0);
 
         let widget = QWidget::new_0a();
-        widget.set_size_policy_2a(Policy::Fixed, Policy::Fixed);
+        // widget.set_size_policy_2a(Policy::Fixed, Policy::MinimumExpanding);
         widget.set_layout(&layout);
 
         let chart = QChart::new_0a();
@@ -266,6 +327,7 @@ impl ShittySpectogram {
         pixlabel.set_scaled_contents(true);
         pixlabel.set_fixed_width(graph_width_i);
         layout.add_widget(&pixlabel);
+        layout.add_stretch_0a();
 
         let history_image = QImage::from_2_int_format(
             frequency_samples as i32,
@@ -364,6 +426,7 @@ impl ShittySpectogram {
 struct App {
     root: QBox<QWidget>,
     device: Rc<DeviceGroup>,
+    receive: Rc<ReceiveGroup>,
     v_layout: QBox<QVBoxLayout>,
     spectogram: ShittySpectogram,
     graph: ShittySpectogram,
@@ -381,12 +444,33 @@ impl App {
 
         let (device, group) = DeviceGroup::new();
         v_layout.add_widget(group);
+        
+        let (receive, group) = ReceiveGroup::new();
+        v_layout.add_widget(group);
         v_layout.add_stretch_0a();
 
         let group2 = QGroupBox::new();
         let layout2 = QGridLayout::new_0a();
+        layout2.set_size_constraint(SizeConstraint::SetMaximumSize);
         group2.set_layout(&layout2);
         h_layout.add_widget(&group2);
+
+        let graph = {
+            let (graph, widget) =
+                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 0, 0.0..1.0, -2.5..2.5);
+
+            let layout = QVBoxLayout::new_0a();
+            layout.add_widget(widget);
+
+            let group = QGroupBox::new();
+            group.set_layout(&layout);
+            group.set_flat(true);
+            group.set_title(&qs("Signal"));
+
+            layout2.add_widget_3a(&group, 0, 0);
+
+            graph
+        };
 
         let spectogram = {
             let (graph, widget) =
@@ -400,24 +484,7 @@ impl App {
             group.set_flat(true);
             group.set_title(&qs("Spectrum"));
 
-            layout2.add_widget(&group);
-
-            graph
-        };
-
-        let graph = {
-            let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 0, 0.0..1.0, -1.5..1.5);
-
-            let layout = QVBoxLayout::new_0a();
-            layout.add_widget(widget);
-
-            let group = QGroupBox::new();
-            group.set_layout(&layout);
-            group.set_flat(true);
-            group.set_title(&qs("Raw"));
-
-            layout2.add_widget(&group);
+            layout2.add_widget_3a(&group, 0, 1);
 
             graph
         };
@@ -429,6 +496,7 @@ impl App {
         Self {
             root,
             device,
+            receive,
             spectogram,
             graph,
             v_layout,
