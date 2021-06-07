@@ -1,16 +1,18 @@
 #![allow(unused)]
 
 mod worker;
+mod device;
+// mod memory_recycler;
 
+use device::{DeviceBoundCommand, DeviceManager, GuiBoundCommand};
 use qt::QHBoxLayout;
-use qt_charts::{*, cpp_core::CppBox, qt_core::{AlignmentFlag, QRectF, QTimer}, qt_gui::{QColor, QIcon, QImage, QPixmap, q_image::Format, q_painter::RenderHint}};
+use qt_charts::{*, cpp_core::CppBox, qt_core::{AlignmentFlag, QRectF, QTimer, SlotOfBool}, qt_gui::{QColor, QIcon, QImage, QPixmap, q_image::Format, q_painter::RenderHint}};
 use qt_widgets::{QCheckBox, QDoubleSpinBox, QFormLayout, QSpinBox, qt_core::{qs, QBox, SlotNoArgs}};
 use qt_widgets::{
     self as qt, q_size_policy::Policy, QApplication, QGridLayout, QGroupBox, QPushButton,
     QVBoxLayout, QWidget,
 };
 use qt_widgets::{cpp_core::Ptr, q_layout::SizeConstraint, QLabel};
-// use realfft::{RealFftPlanner, RealToComplex, num_complex::Complex64};
 use rustfft::{num_complex::Complex64, Fft, FftPlanner};
 use soapysdr::{Args, Device};
 use std::{borrow::Borrow, cell::RefCell, f64::consts::FRAC_PI_2, ops::Range, rc::Rc, sync::Arc};
@@ -49,21 +51,27 @@ impl Radio {
 struct DeviceGroup {
     group: QBox<QGroupBox>,
     combo_box: QBox<qt::QComboBox>,
+    auto_select: QBox<QCheckBox>,
     entry: QBox<qt::QLineEdit>,
     row_widget: QBox<QWidget>,
     b1: QBox<qt::QPushButton>,
     b2: QBox<qt::QPushButton>,
     b3: QBox<qt::QPushButton>,
-    radio: RefCell<Radio>,
+
+    device: Rc<RefCell<DeviceManager>>,
+    devices: Option<Vec<String>>
 }
 
 impl DeviceGroup {
-    unsafe fn new() -> (Rc<DeviceGroup>, Ptr<QGroupBox>) {
+    unsafe fn new(device: Rc<RefCell<DeviceManager>>) -> (Rc<DeviceGroup>, Ptr<QGroupBox>) {
         let layout = QVBoxLayout::new_0a();
         let group = QGroupBox::new();
         group.set_title(&qs("Device"));
         group.set_layout(&layout);
-        // group.set_size_policy_2a(Policy::Fixed, Policy::MinimumExpanding);
+
+        let auto_select = QCheckBox::new();
+        auto_select.set_text(&qs("Auto select device"));
+        layout.add_widget(&auto_select);
 
         let entry = qt::QLineEdit::new();
         entry.set_placeholder_text(&qs("Device filter"));
@@ -77,6 +85,7 @@ impl DeviceGroup {
         let b3 = QPushButton::from_q_string(&qs("Stop"));
         b2.set_enabled(false);
         b3.set_enabled(false);
+
 
         row_layout.add_widget(&b1);
         row_layout.add_widget(&b2);
@@ -99,7 +108,10 @@ impl DeviceGroup {
             b1,
             b2,
             b3,
-            radio: RefCell::new(Radio::new()),
+            auto_select,
+            // radio: RefCell::new(Radio::new()),
+            device,
+            devices: None
         });
 
         s.init();
@@ -109,59 +121,53 @@ impl DeviceGroup {
     unsafe fn init(self: &Rc<Self>) {
         let Self {
             group,
+            auto_select,
             combo_box,
             b1,
             b2,
             b3,
+            device,
             ..
         } = self.borrow();
+
+        let s = self.clone();
+        auto_select.clicked().connect(&SlotOfBool::new(group, move |checked| {
+            s.entry.set_enabled(!checked);
+            s.combo_box.set_enabled(!checked);
+        }));
 
         let s = self.clone();
         combo_box
             .current_index_changed()
             .connect(&SlotNoArgs::new(group, move || {
-                let enabled = (s.combo_box.count() != 0) && s.radio.borrow().device.is_none();
+                let enabled = (s.combo_box.count() != 0) && !s.device.borrow_mut().get_device_valid();
                 s.b2.set_enabled(enabled)
             }));
 
         let s = self.clone();
         b1.clicked().connect(&SlotNoArgs::new(group, move || {
-            let filter = s.entry.text();
+            let filter = s.entry.text().to_std_string();
 
-            let args = soapysdr::enumerate(filter.to_std_string().as_str()).unwrap();
+            s.device.borrow_mut().send_command(DeviceBoundCommand::RefreshDevices {
+                args: filter
+            });
 
-            s.combo_box.clear();
-
-            for arg in &args {
-                s.combo_box
-                    .add_item_q_string(&qs(arg.get("label").unwrap_or("")));
-            }
-
-            s.radio.borrow_mut().args = args;
+            s.b1.set_enabled(false);
+            
         }));
 
         let s = self.clone();
         b2.clicked().connect(&SlotNoArgs::new(group, move || {
-            fn clone_args(a: &Args) -> Args {
-                let mut c = Args::new();
-                for (k, v) in a {
-                    c.set(k, v)
-                }
-                c
-            }
 
             if s.combo_box.count() != 0 {
+                let index = s.combo_box.current_index();
+
+                s.device.borrow_mut().send_command(DeviceBoundCommand::CreateDevice {
+                    index: index as usize,
+                });
+                
                 s.b2.set_enabled(false);
                 s.b3.set_enabled(true);
-
-                let backend = &mut s.radio.borrow_mut();
-
-                drop(backend.device.take()); // drop the previous device first so that the connection gets closed
-
-                let arg_clone = clone_args(&backend.args[s.combo_box.current_index() as usize]);
-                let device = Device::new(arg_clone).unwrap();
-
-                backend.device = Some(device);
             }
         }));
 
@@ -170,12 +176,31 @@ impl DeviceGroup {
             s.b2.set_enabled(true);
             s.b3.set_enabled(false);
 
-            let device_ref = &mut s.radio.borrow_mut().device;
-
-            drop(device_ref.take());
+            s.device.borrow_mut().send_command(DeviceBoundCommand::DestroyDevice);
         }));
 
         b1.click();
+    }
+    unsafe fn handle_event(&self, event: &GuiBoundCommand) -> bool {
+        match event {
+            GuiBoundCommand::DeviceCreated { channels_info } => true,
+            GuiBoundCommand::DeviceDestroyed => true,
+            // GuiBoundCommand::Error { desc, fatal } => false,
+            GuiBoundCommand::RefreshedDevices { list } => {
+                self.b1.set_enabled(true);
+
+                self.combo_box.clear();
+
+                for name in list {
+                    self.combo_box.add_item_q_string(&qs(name.as_str()));
+                }
+
+                true
+            },
+            // GuiBoundCommand::DecodedChars { data } => false,
+            // GuiBoundCommand::DataReady { time_domain, frequency_domain } => todo!(),
+            _ => false
+        }
     }
 }
 
@@ -420,16 +445,20 @@ impl ShittySpectogram {
 
 struct App {
     root: QBox<QWidget>,
-    device: Rc<DeviceGroup>,
+    device_group: Rc<DeviceGroup>,
     receive: Rc<ReceiveGroup>,
     v_layout: QBox<QVBoxLayout>,
     spectogram: ShittySpectogram,
     graph: ShittySpectogram,
-    worker: Worker,
+    // worker: Worker,
+
+    device: Rc<RefCell<DeviceManager>>
 }
 
 impl App {
     unsafe fn new() -> Self {
+        let device = Rc::new(RefCell::new(DeviceManager::new()));
+
         let root = QWidget::new_0a();
         let h_layout = QHBoxLayout::new_1a(&root);
 
@@ -437,7 +466,7 @@ impl App {
 
         h_layout.add_layout_1a(&v_layout);
 
-        let (device, group) = DeviceGroup::new();
+        let (device_group, group) = DeviceGroup::new(device.clone());
         v_layout.add_widget(group);
         
         let (receive, group) = ReceiveGroup::new();
@@ -490,73 +519,74 @@ impl App {
 
         Self {
             root,
-            device,
+            device_group,
             receive,
             spectogram,
             graph,
             v_layout,
-            worker: Worker::new(),
+            // worker: Worker::new(),
+            device
         }
     }
 }
 
-struct FftData {
-    fft: Arc<dyn Fft<f64>>,
-    input: Box<[Complex64]>,
-    output: Box<[Complex64]>,
-    scratch: Box<[Complex64]>,
-}
+// struct FftData {
+//     fft: Arc<dyn Fft<f64>>,
+//     input: Box<[Complex64]>,
+//     output: Box<[Complex64]>,
+//     scratch: Box<[Complex64]>,
+// }
 
-impl FftData {
-    fn new(len: usize) -> Self {
-        let fft = FftPlanner::new().plan_fft_forward(len);
-        // let scratch = fft.get_outofplace_scratch_len();
-        let scratch = fft.get_outofplace_scratch_len();
+// impl FftData {
+//     fn new(len: usize) -> Self {
+//         let fft = FftPlanner::new().plan_fft_forward(len);
+//         // let scratch = fft.get_outofplace_scratch_len();
+//         let scratch = fft.get_outofplace_scratch_len();
 
-        let input = vec![Default::default(); len].into_boxed_slice();
-        let output = vec![Default::default(); len].into_boxed_slice();
-        let scratch = vec![Default::default(); scratch].into_boxed_slice();
+//         let input = vec![Default::default(); len].into_boxed_slice();
+//         let output = vec![Default::default(); len].into_boxed_slice();
+//         let scratch = vec![Default::default(); scratch].into_boxed_slice();
 
-        Self {
-            fft,
-            input,
-            output,
-            scratch,
-        }
-    }
-    fn get_input(&self) -> &[Complex64] {
-        &self.input
-    }
-    fn get_input_mut(&mut self) -> &mut [Complex64] {
-        &mut self.input
-    }
-    fn get_output(&self) -> &[Complex64] {
-        &self.output
-    }
+//         Self {
+//             fft,
+//             input,
+//             output,
+//             scratch,
+//         }
+//     }
+//     fn get_input(&self) -> &[Complex64] {
+//         &self.input
+//     }
+//     fn get_input_mut(&mut self) -> &mut [Complex64] {
+//         &mut self.input
+//     }
+//     fn get_output(&self) -> &[Complex64] {
+//         &self.output
+//     }
 
-    fn process(&mut self) {
-        self.fft.process_outofplace_with_scratch(
-            &mut self.input,
-            &mut self.output,
-            &mut self.scratch,
-        );
-    }
-}
+//     fn process(&mut self) {
+//         self.fft.process_outofplace_with_scratch(
+//             &mut self.input,
+//             &mut self.output,
+//             &mut self.scratch,
+//         );
+//     }
+// }
 
-impl Clone for FftData {
-    fn clone(&self) -> Self {
-        let input = vec![Default::default(); self.input.len()].into_boxed_slice();
-        let output = vec![Default::default(); self.output.len()].into_boxed_slice();
-        let scratch = vec![Default::default(); self.scratch.len()].into_boxed_slice();
+// impl Clone for FftData {
+//     fn clone(&self) -> Self {
+//         let input = vec![Default::default(); self.input.len()].into_boxed_slice();
+//         let output = vec![Default::default(); self.output.len()].into_boxed_slice();
+//         let scratch = vec![Default::default(); self.scratch.len()].into_boxed_slice();
 
-        Self {
-            fft: self.fft.clone(),
-            input,
-            output,
-            scratch,
-        }
-    }
-}
+//         Self {
+//             fft: self.fft.clone(),
+//             input,
+//             output,
+//             scratch,
+//         }
+//     }
+// }
 
 fn main() {
     QApplication::init(|_| unsafe {
@@ -564,58 +594,66 @@ fn main() {
         let mut app = App::new();
         let timer = QTimer::new_0a();
         // let rand = Rc::new(RefCell::new(0.0));
-        let mut a: f64 = 1.0;
-        timer.set_interval(50);
-        let start = std::time::Instant::now();
+        // let mut a: f64 = 1.0;
+        // timer.set_interval(50);
+        // let start = std::time::Instant::now();
 
-        let mut fft = None;
-        let mut task: Option<FinishedMaybe<FftData>> = None;
+        // let mut fft = None;
+        // let mut task: Option<FinishedMaybe<FftData>> = None;
 
         timer.timeout().connect(&SlotNoArgs::new(&timer, move || {
-            unsafe fn color(f: f64) -> CppBox<QColor> {
-                QColor::from_rgb_f_3a(f.ln() * 0.2, 0.0, 0.0)
-            };
+            // unsafe fn color(f: f64) -> CppBox<QColor> {
+            //     QColor::from_rgb_f_3a(f.ln() * 0.2, 0.0, 0.0)
+            // };
 
-            let mut finished_task = None;
+            // let mut finished_task = None;
 
-            if let Some(task) = &mut task {
-                match task.poll().ok().unwrap() {
-                    worker::Poll::Ready(t) => finished_task = Some(t),
-                    worker::Poll::Pending => (),
-                    _ => unimplemented!(),
+            // if let Some(task) = &mut task {
+            //     match task.poll().ok().unwrap() {
+            //         worker::Poll::Ready(t) => finished_task = Some(t),
+            //         worker::Poll::Pending => (),
+            //         _ => unimplemented!(),
+            //     }
+            // };
+
+            // if finished_task.is_some() || task.is_none() {
+            //     let new_fft = || FftData::new(SAMPLE_COUNT);
+            //     let mut fft = fft.take().unwrap_or_else(new_fft);
+
+            //     app.device.radio.borrow_mut().get_data(fft.get_input_mut());
+
+            //     let new_task = app
+            //         .worker
+            //         .add_work(move || {
+            //             fft.process();
+
+            //             fft
+            //         })
+            //         .ok()
+            //         .unwrap();
+
+            //     task = Some(new_task);
+            // }
+
+            // if let Some(finished) = finished_task.take() {
+            //     let iter = finished
+            //         .get_output()
+            //         .iter()
+            //         .map(|c| (c.re * c.re + c.im * c.im).sqrt()).take(SAMPLE_COUNT/2+1);
+            //     app.spectogram.add_new_data(iter, color);
+
+            //     let iter = finished.get_input().iter().map(|c| c.re);
+            //     app.graph.add_new_data(iter, color);
+
+            //     fft = Some(finished);
+            // }
+
+            if let Some(event) = app.device.borrow_mut().try_receive() {
+                app.device_group.handle_event(&event);
+                match event {
+                    GuiBoundCommand::Error { desc, fatal } => todo!("TODO error handling: {}", desc),
+                    _ => ()
                 }
-            };
-
-            if finished_task.is_some() || task.is_none() {
-                let new_fft = || FftData::new(SAMPLE_COUNT);
-                let mut fft = fft.take().unwrap_or_else(new_fft);
-
-                app.device.radio.borrow_mut().get_data(fft.get_input_mut());
-
-                let new_task = app
-                    .worker
-                    .add_work(move || {
-                        fft.process();
-
-                        fft
-                    })
-                    .ok()
-                    .unwrap();
-
-                task = Some(new_task);
-            }
-
-            if let Some(finished) = finished_task.take() {
-                let iter = finished
-                    .get_output()
-                    .iter()
-                    .map(|c| (c.re * c.re + c.im * c.im).sqrt()).take(SAMPLE_COUNT/2+1);
-                app.spectogram.add_new_data(iter, color);
-
-                let iter = finished.get_input().iter().map(|c| c.re);
-                app.graph.add_new_data(iter, color);
-
-                fft = Some(finished);
             }
         }));
 
