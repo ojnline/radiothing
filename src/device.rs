@@ -1,39 +1,65 @@
-use std::{error::Error, iter::FromIterator, mem::ManuallyDrop, ops::Deref, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering::{Acquire, Release}}, mpsc::{Receiver, Sender, channel}}, thread::{self, JoinHandle}, usize};
+use std::{
+    cell::Cell,
+    error::Error,
+    iter::FromIterator,
+    mem::ManuallyDrop,
+    ops::Deref,
+    sync::{
+        atomic::{
+            AtomicBool,
+            Ordering::{Acquire, Release},
+        },
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    usize,
+};
 
-use rustfft::{Fft, FftPlanner, num_complex::{Complex, Complex64}};
+use rustfft::{
+    num_complex::{Complex, Complex64},
+    Fft, FftPlanner,
+};
 use soapysdr::{Args, Device, Direction::Rx, Range, RxStream};
 
 pub enum DeviceBoundCommand {
     DestroyDevice,
     CreateDevice {
-        index: usize
+        index: usize,
     },
     RefreshDevices {
-        args: String
+        args: String,
     },
     SetReceiver(ReceiverState),
     RequestData {
         len: usize,
-        downsample: usize // how many samples to average together: 1 means no downsampling, 2 means halved data, ...
-        // buffer: Arc<Mutex<Box<[Complex64]>>>
-    }
+        downsample: usize, // how many samples to average together: 1 means no downsampling, 2 means halved data, ...
+                           // buffer: Arc<Mutex<Box<[Complex64]>>>
+    },
 }
 pub enum GuiBoundCommand {
-    DeviceCreated{channels_info: Vec<ChannelInfo>},
+    DeviceCreated {
+        channels_info: Vec<ChannelInfo>,
+    },
     DeviceDestroyed,
-    Error{desc: String, fatal: bool},
-    RefreshedDevices{list: Vec<String>},
+    Error {
+        desc: String,
+        fatal: bool,
+    },
+    RefreshedDevices {
+        list: Vec<String>,
+    },
     DecodedChars {
-        data: String
+        data: String,
     },
     DataReady {
         time_domain: Box<[Complex64]>,
-        frequency_domain: Box<[Complex64]>
-    }
+        frequency_domain: Box<[Complex64]>,
+    },
 }
 
 #[derive(Clone)]
-pub struct ReceiverState  {
+pub struct ReceiverState {
     channel: usize,
     samplerate: f64,
     frequency: f64,
@@ -45,15 +71,15 @@ pub struct ReceiverState  {
 
 pub struct ChannelInfo {
     pub ranges: ValueRanges,
-    pub info: Args
+    pub info: Args,
 }
-unsafe impl Send for ChannelInfo { }
+unsafe impl Send for ChannelInfo {}
 
 pub struct ValueRanges {
     samplerate: Vec<Range>,
     bandwidth: Vec<Range>,
     frequency: Vec<Range>,
-    gain: Range
+    gain: Range,
 }
 
 pub struct DeviceManager {
@@ -61,8 +87,9 @@ pub struct DeviceManager {
     sender: Sender<DeviceBoundCommand>,
     receiver: Receiver<GuiBoundCommand>,
 
-    device_valid: bool,
-    receiver_valid: bool,
+    device_valid: Cell<bool>,
+    receiver_valid: Cell<bool>,
+    refreshing_devices: Cell<bool>,
 }
 
 impl DeviceManager {
@@ -81,7 +108,7 @@ impl DeviceManager {
                 working_memory: None,
                 fft_planner: FftPlanner::new(),
             };
-            
+
             worker.process();
         });
 
@@ -90,29 +117,46 @@ impl DeviceManager {
             sender: device_sender_channel,
             receiver: gui_receive_channel,
 
-            device_valid: false,
-            receiver_valid: false
+            device_valid: Cell::new(false),
+            receiver_valid: Cell::new(false),
+            refreshing_devices: Cell::new(false),
         }
     }
-    pub fn get_device_valid(&mut self) -> bool {self.device_valid}
-    pub fn get_receiver_valid(&mut self) -> bool {self.receiver_valid}
-    pub fn send_command(&mut self, command: DeviceBoundCommand) -> Result<(), BadState>{
-        let Self {device_valid, receiver_valid, ..} = self;
+    pub fn get_device_valid(&self) -> bool {
+        self.device_valid.get()
+    }
+    pub fn get_receiver_valid(&self) -> bool {
+        self.receiver_valid.get()
+    }
+    pub fn get_refreshing_devices(&self) -> bool {
+        self.refreshing_devices.get()
+    }
+    pub fn send_command(&self, command: DeviceBoundCommand) -> Result<(), BadState> {
+        let Self {
+            device_valid,
+            receiver_valid,
+            refreshing_devices,
+            ..
+        } = self;
 
         match &command {
-            DeviceBoundCommand::DestroyDevice => if *device_valid {
-                *device_valid = false;
-                *receiver_valid = false;
-            } else {
-                return Err(BadState);
-            },
-            DeviceBoundCommand::CreateDevice { .. } => if *device_valid {
-                return Err(BadState);
-            } else {
-                *device_valid = true
-            },
-            DeviceBoundCommand::RefreshDevices { .. } => (),
-            DeviceBoundCommand::SetReceiver(_) => *receiver_valid = true,
+            DeviceBoundCommand::DestroyDevice => {
+                if device_valid.get() {
+                    device_valid.set(false);
+                    receiver_valid.set(false);
+                } else {
+                    return Err(BadState);
+                }
+            }
+            DeviceBoundCommand::CreateDevice { .. } => {
+                if device_valid.get() {
+                    return Err(BadState);
+                } else {
+                    device_valid.set(true);
+                }
+            }
+            DeviceBoundCommand::RefreshDevices { .. } => refreshing_devices.set(true),
+            DeviceBoundCommand::SetReceiver(_) => receiver_valid.set(true),
             DeviceBoundCommand::RequestData { .. } => (),
         }
 
@@ -122,7 +166,30 @@ impl DeviceManager {
     }
     // pub fn receive_blocking(&self) -> Result<GuiBoundCommand, ()> {self.receiver.recv().map_err(|_| ())}
     pub fn try_receive(&self) -> Option<GuiBoundCommand> {
-        self.receiver.try_recv().ok()
+        let Self {
+            device_valid,
+            receiver_valid,
+            refreshing_devices,
+            ..
+        } = self;
+
+        let event = self.receiver.try_recv().ok();
+
+        if let Some(event) = event.as_ref() {
+            match event {
+                GuiBoundCommand::DeviceCreated { channels_info } => {}
+                GuiBoundCommand::DeviceDestroyed => {}
+                GuiBoundCommand::Error { desc, fatal } => {}
+                GuiBoundCommand::RefreshedDevices { list } => refreshing_devices.set(false),
+                GuiBoundCommand::DecodedChars { data } => {}
+                GuiBoundCommand::DataReady {
+                    time_domain,
+                    frequency_domain,
+                } => {}
+            }
+        }
+
+        event
     }
 }
 
@@ -131,7 +198,6 @@ pub struct BadState;
 // const FFT_CACHE_MAX_CYCLES: usize = 2;
 struct DeviceWorker {
     // stop_flag: Arc<AtomicBool>,
-
     receiver: Receiver<DeviceBoundCommand>,
     sender: Sender<GuiBoundCommand>,
 
@@ -148,7 +214,6 @@ struct DeviceWorker {
 }
 
 impl DeviceWorker {
-    
     fn error_process(&mut self) -> Result<(), Box<dyn Error>> {
         fn clone_args(a: &Args) -> Args {
             let mut c = Args::new();
@@ -159,7 +224,6 @@ impl DeviceWorker {
         }
 
         loop {
-
             // this will block until there is a command available, this is hopefully implemented with the proper primitives so the thread won't spin the cpu endlessly
             let event = match self.receiver.recv() {
                 Ok(command) => command,
@@ -190,17 +254,12 @@ impl DeviceWorker {
                             gain: dev.gain_range(Rx, i)?,
                         };
 
-                        channels_info.push(ChannelInfo {
-                            ranges,
-                            info
-                        })
+                        channels_info.push(ChannelInfo { ranges, info })
                     }
 
-                    self.sender.send(GuiBoundCommand::DeviceCreated {
-                        channels_info 
-                    })?;
+                    self.sender
+                        .send(GuiBoundCommand::DeviceCreated { channels_info })?;
                     self.device = Some(dev);
-
                 }
                 DeviceBoundCommand::DestroyDevice => {
                     self.receive_stream = None;
@@ -209,17 +268,19 @@ impl DeviceWorker {
 
                     self.sender.send(GuiBoundCommand::DeviceDestroyed)?;
                 }
-                DeviceBoundCommand::RefreshDevices{args} => {
+                DeviceBoundCommand::RefreshDevices { args } => {
                     let available = soapysdr::enumerate(args.as_str())?;
-                    let names = available.iter().map(|d| d.get("label").unwrap().to_owned()).collect();
+                    let names = available
+                        .iter()
+                        .map(|d| d.get("label").unwrap().to_owned())
+                        .collect();
 
-                    self.sender.send(GuiBoundCommand::RefreshedDevices {
-                        list: names
-                    });
+                    self.sender
+                        .send(GuiBoundCommand::RefreshedDevices { list: names });
                 }
                 DeviceBoundCommand::SetReceiver(state) => {
-                    assert!(self.device.is_some()); 
-                    
+                    assert!(self.device.is_some());
+
                     // compares the new state to the one currently set and if they differ (or the previous state is unset, this is why it's so ugly) run the block
                     macro_rules! if_differs {
                         ($($var:ident, $then:expr);+ $(;)?) => {
@@ -231,7 +292,15 @@ impl DeviceWorker {
                         }
                     }
 
-                    let ReceiverState { channel, samplerate, frequency, bandwidth, gain, automatic_gain, automatic_dc_offset } = state.clone();
+                    let ReceiverState {
+                        channel,
+                        samplerate,
+                        frequency,
+                        bandwidth,
+                        gain,
+                        automatic_gain,
+                        automatic_dc_offset,
+                    } = state.clone();
 
                     let dev = self.device.as_ref().unwrap();
 
@@ -259,10 +328,8 @@ impl DeviceWorker {
 
         if let Err(e) = result {
             let desc = format!("{}", e);
-            self.sender.send(GuiBoundCommand::Error {
-                desc,
-                fatal: true
-            });
+            self.sender
+                .send(GuiBoundCommand::Error { desc, fatal: true });
         }
     }
 }

@@ -1,21 +1,36 @@
 #![allow(unused)]
 
-mod worker;
 mod device;
+mod worker;
 // mod memory_recycler;
 
 use device::{DeviceBoundCommand, DeviceManager, GuiBoundCommand};
 use qt::QHBoxLayout;
-use qt_charts::{*, cpp_core::CppBox, qt_core::{AlignmentFlag, QRectF, QTimer, SlotOfBool}, qt_gui::{QColor, QIcon, QImage, QPixmap, q_image::Format, q_painter::RenderHint}};
-use qt_widgets::{QCheckBox, QDoubleSpinBox, QFormLayout, QSpinBox, qt_core::{qs, QBox, SlotNoArgs}};
+use qt_charts::{
+    cpp_core::CppBox,
+    qt_core::{AlignmentFlag, QRectF, QTimer, SlotOfBool},
+    qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QIcon, QImage, QPixmap},
+    *,
+};
 use qt_widgets::{
     self as qt, q_size_policy::Policy, QApplication, QGridLayout, QGroupBox, QPushButton,
     QVBoxLayout, QWidget,
 };
 use qt_widgets::{cpp_core::Ptr, q_layout::SizeConstraint, QLabel};
+use qt_widgets::{
+    qt_core::{qs, QBox, SlotNoArgs},
+    QCheckBox, QDoubleSpinBox, QFormLayout, QSpinBox, QTextEdit,
+};
 use rustfft::{num_complex::Complex64, Fft, FftPlanner};
 use soapysdr::{Args, Device};
-use std::{borrow::Borrow, cell::RefCell, f64::consts::FRAC_PI_2, ops::Range, rc::Rc, sync::Arc};
+use std::{
+    borrow::Borrow,
+    cell::{Cell, RefCell},
+    f64::consts::FRAC_PI_2,
+    ops::Range,
+    rc::Rc,
+    sync::Arc,
+};
 use worker::{FinishedMaybe, Worker};
 
 const SAMPLE_COUNT: usize = 256;
@@ -59,7 +74,7 @@ struct DeviceGroup {
     b3: QBox<qt::QPushButton>,
 
     device: Rc<RefCell<DeviceManager>>,
-    devices: Option<Vec<String>>
+    devices: Option<Vec<String>>,
 }
 
 impl DeviceGroup {
@@ -86,7 +101,6 @@ impl DeviceGroup {
         b2.set_enabled(false);
         b3.set_enabled(false);
 
-
         row_layout.add_widget(&b1);
         row_layout.add_widget(&b2);
         row_layout.add_widget(&b3);
@@ -111,7 +125,7 @@ impl DeviceGroup {
             auto_select,
             // radio: RefCell::new(Radio::new()),
             device,
-            devices: None
+            devices: None,
         });
 
         s.init();
@@ -131,41 +145,42 @@ impl DeviceGroup {
         } = self.borrow();
 
         let s = self.clone();
-        auto_select.clicked().connect(&SlotOfBool::new(group, move |checked| {
-            s.entry.set_enabled(!checked);
-            s.combo_box.set_enabled(!checked);
-        }));
+        auto_select
+            .clicked()
+            .connect(&SlotOfBool::new(group, move |checked| {
+                s.entry.set_enabled(!checked);
+                s.combo_box.set_enabled(!checked);
+            }));
 
         let s = self.clone();
         combo_box
             .current_index_changed()
             .connect(&SlotNoArgs::new(group, move || {
-                let enabled = (s.combo_box.count() != 0) && !s.device.borrow_mut().get_device_valid();
+                let enabled =
+                    (s.combo_box.count() != 0) && !RefCell::borrow(&s.device).get_device_valid();
                 s.b2.set_enabled(enabled)
             }));
 
         let s = self.clone();
         b1.clicked().connect(&SlotNoArgs::new(group, move || {
-            let filter = s.entry.text().to_std_string();
+            // only send refresh request when the last one has finished
+            if !RefCell::borrow(&s.device).get_refreshing_devices() {
+                let filter = s.entry.text().to_std_string();
 
-            s.device.borrow_mut().send_command(DeviceBoundCommand::RefreshDevices {
-                args: filter
-            });
-
-            s.b1.set_enabled(false);
-            
+                RefCell::borrow(&s.device)
+                    .send_command(DeviceBoundCommand::RefreshDevices { args: filter });
+            }
         }));
 
         let s = self.clone();
         b2.clicked().connect(&SlotNoArgs::new(group, move || {
-
             if s.combo_box.count() != 0 {
                 let index = s.combo_box.current_index();
 
-                s.device.borrow_mut().send_command(DeviceBoundCommand::CreateDevice {
+                RefCell::borrow(&s.device).send_command(DeviceBoundCommand::CreateDevice {
                     index: index as usize,
                 });
-                
+
                 s.b2.set_enabled(false);
                 s.b3.set_enabled(true);
             }
@@ -176,7 +191,7 @@ impl DeviceGroup {
             s.b2.set_enabled(true);
             s.b3.set_enabled(false);
 
-            s.device.borrow_mut().send_command(DeviceBoundCommand::DestroyDevice);
+            RefCell::borrow(&s.device).send_command(DeviceBoundCommand::DestroyDevice);
         }));
 
         b1.click();
@@ -187,8 +202,6 @@ impl DeviceGroup {
             GuiBoundCommand::DeviceDestroyed => true,
             // GuiBoundCommand::Error { desc, fatal } => false,
             GuiBoundCommand::RefreshedDevices { list } => {
-                self.b1.set_enabled(true);
-
                 self.combo_box.clear();
 
                 for name in list {
@@ -196,10 +209,10 @@ impl DeviceGroup {
                 }
 
                 true
-            },
+            }
             // GuiBoundCommand::DecodedChars { data } => false,
             // GuiBoundCommand::DataReady { time_domain, frequency_domain } => todo!(),
-            _ => false
+            _ => false,
         }
     }
 }
@@ -211,25 +224,19 @@ struct ReceiveGroup {
     gain: QBox<QDoubleSpinBox>,
     automatic_gain: QBox<QCheckBox>,
     automatic_dc_offset: QBox<QCheckBox>,
-    // samplerate: f64,
-    // frequency: f64,
-    // bandwidth: u64,
-    // gain: f64,
-    // automatic_gain: bool,
-    // automatic_dc_offset: bool,
 
-    group: QBox<QGroupBox>
+    group: QBox<QGroupBox>,
 }
 
 impl ReceiveGroup {
     unsafe fn new() -> (Rc<Self>, Ptr<QGroupBox>) {
         let group = QGroupBox::new();
         group.set_title(&qs("Receive"));
-        
+
         let layout = QFormLayout::new_0a();
         // layout.set_size_constraint(SizeConstraint::SetFixedSize);
         group.set_layout(&layout);
-        
+
         let samplerate = QDoubleSpinBox::new_0a();
         layout.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
 
@@ -241,15 +248,15 @@ impl ReceiveGroup {
 
         let gain = QDoubleSpinBox::new_0a();
         layout.add_row_q_string_q_widget(&qs("Gain"), &gain);
-        
+
         let automatic_gain = QCheckBox::new();
         layout.add_row_q_string_q_widget(&qs("Automatic gain"), &automatic_gain);
-       
+
         let automatic_dc_offset = QCheckBox::new();
         layout.add_row_q_string_q_widget(&qs("Automatic DC offset"), &automatic_dc_offset);
-        
+
         let ptr = group.as_ptr();
-        let s = Rc::new(Self{
+        let s = Rc::new(Self {
             samplerate,
             frequency,
             bandwidth,
@@ -264,18 +271,18 @@ impl ReceiveGroup {
 }
 
 struct ShittySpectogram {
-    graph_width: u32,
-    graph_height: u32,
-    frequency_samples: u32,
-    spectogram_history_count: u32,
+    graph_width: Cell<u32>,
+    graph_height: Cell<u32>,
+    frequency_samples: Cell<u32>,
+    spectogram_history_count: Cell<u32>,
+    recreate_image: Cell<bool>,
+
     widget: QBox<QWidget>,
     chart: QBox<QChart>,
     view: QBox<QChartView>,
     series: QBox<QLineSeries>,
-    // series: QBox<QSplineSeries>,
-    history_image: CppBox<QImage>,
+    history_image: RefCell<CppBox<QImage>>,
     pixlabel: QBox<QLabel>,
-    recreate_image: bool,
 }
 
 impl ShittySpectogram {
@@ -328,8 +335,8 @@ impl ShittySpectogram {
         chart.set_plot_area(&QRectF::from_4_double(
             0.0,
             y_space,
-            graph_width_f,  /*  - x_space * 2.0 */
-            graph_height_f, /* - bottom_padding */
+            graph_width_f,
+            graph_height_f,
         ));
 
         let chart_view = QChartView::from_q_chart(&chart);
@@ -362,70 +369,70 @@ impl ShittySpectogram {
             chart,
             view: chart_view,
             series,
-            graph_width,
-            graph_height,
-            frequency_samples,
-            spectogram_history_count,
+            graph_width: Cell::new(graph_width),
+            graph_height: Cell::new(graph_height),
+            frequency_samples: Cell::new(frequency_samples),
+            spectogram_history_count: Cell::new(spectogram_history_count),
 
-            history_image,
+            history_image: RefCell::new(history_image),
             pixlabel,
-            recreate_image: false,
+            recreate_image: Cell::new(false),
         };
 
         (s, ptr)
     }
 
-    unsafe fn set_sample_count(&mut self, count: u32) {
-        self.recreate_image = true;
-        self.frequency_samples = count;
+    unsafe fn set_sample_count(&self, count: u32) {
+        self.recreate_image.set(true);
+        self.frequency_samples.set(count);
     }
 
-    unsafe fn set_history_count(&mut self, count: u32) {
-        self.recreate_image = true;
-        self.spectogram_history_count = count;
+    unsafe fn set_history_count(&self, count: u32) {
+        self.recreate_image.set(true);
+        self.spectogram_history_count.set(count);
     }
 
     // resize and clear image
-    unsafe fn recreate_image(&mut self) {
+    unsafe fn recreate_image(&self) {
         let new_image = QImage::from_2_int_format(
-            self.frequency_samples as i32,
-            self.spectogram_history_count as i32,
+            self.frequency_samples.get() as i32,
+            self.spectogram_history_count.get() as i32,
             Format::FormatRGB32,
         );
         new_image.fill_uint(0);
-        self.history_image = new_image;
-        self.recreate_image = false;
+        *self.history_image.borrow_mut() = new_image;
+        self.recreate_image.set(false);
     }
 
     unsafe fn add_new_data(
-        &mut self,
+        &self,
         data: impl ExactSizeIterator<Item = f64>,
         coloring_fn: unsafe fn(f64) -> CppBox<QColor>,
     ) {
-        if self.frequency_samples != data.len() as u32 {
+        if self.frequency_samples.get() != data.len() as u32 {
             self.set_sample_count(data.len() as u32);
         }
 
         self.series.clear();
         let d_x = 1.0 / (data.len() as f64);
 
-        let is_spectogram = self.spectogram_history_count != 0;
+        let is_spectogram = self.spectogram_history_count.get() != 0;
 
         if is_spectogram {
-            if self.recreate_image {
+            if self.recreate_image.get() {
                 self.recreate_image();
             } else {
                 // shift image data one row down
-                let samples = self.frequency_samples as usize;
-                let row = self.history_image.scan_line_mut(0) as *mut u32;
+                let samples = self.frequency_samples.get() as usize;
+                let row = self.history_image.borrow().scan_line_mut(0) as *mut u32;
                 std::ptr::copy(
                     row,
                     row.add(samples),
-                    samples * (self.spectogram_history_count as usize - 1),
+                    samples * (self.spectogram_history_count.get() as usize - 1),
                 );
             }
 
-            let row = self.history_image.scan_line_mut(0) as *mut u32;
+            let row = self.history_image.borrow().scan_line_mut(0) as *mut u32;
             for (i, p) in data.enumerate() {
                 self.series.append_2_double(d_x * i as f64, p);
 
@@ -433,7 +440,7 @@ impl ShittySpectogram {
                 row.add(i).write(color.rgb());
             }
 
-            let pixmap = QPixmap::from_image_1a(&self.history_image);
+            let pixmap = QPixmap::from_image_1a(&*self.history_image.borrow());
             self.pixlabel.set_pixmap(&pixmap);
         } else {
             for (i, p) in data.enumerate() {
@@ -442,17 +449,84 @@ impl ShittySpectogram {
         }
     }
 }
+struct OutputGroup {
+    group: QBox<QGroupBox>,
+    grid: QBox<QGridLayout>,
+    signal: ShittySpectogram,
+    spectrum: ShittySpectogram,
+    text_edit: QBox<QTextEdit>,
+}
+
+impl OutputGroup {
+    unsafe fn new() -> (Rc<Self>, Ptr<QGroupBox>) {
+        let group = QGroupBox::new();
+        let grid = QGridLayout::new_0a();
+
+        grid.set_size_constraint(SizeConstraint::SetMaximumSize);
+        group.set_layout(&grid);
+
+        let signal = {
+            let (graph, widget) =
+                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 0, 0.0..1.0, -2.5..2.5);
+
+            let layout = QVBoxLayout::new_0a();
+            layout.add_widget(widget);
+
+            let group = QGroupBox::new();
+            group.set_layout(&layout);
+            group.set_flat(true);
+            group.set_title(&qs("Signal"));
+
+            grid.add_widget_3a(&group, 0, 0);
+
+            graph
+        };
+
+        let spectrum = {
+            let (graph, widget) =
+                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 40, 0.0..1.0, -10.0..150.0);
+
+            let layout = QVBoxLayout::new_0a();
+            layout.add_widget(widget);
+
+            let group = QGroupBox::new();
+            group.set_layout(&layout);
+            group.set_flat(true);
+            group.set_title(&qs("Spectrum"));
+
+            grid.add_widget_3a(&group, 0, 1);
+
+            graph
+        };
+
+        let text_edit = QTextEdit::new();
+        text_edit.set_read_only(true);
+        grid.add_widget_5a(&text_edit, 1, 0, 1, 2);
+
+        let ptr = group.as_ptr();
+        let s = Rc::new(Self {
+            group,
+            grid,
+            signal,
+            spectrum,
+            text_edit,
+        });
+
+        (s, ptr)
+    }
+    unsafe fn handle_event(&self, event: &GuiBoundCommand) -> bool {
+        todo!()
+    }
+}
 
 struct App {
     root: QBox<QWidget>,
-    device_group: Rc<DeviceGroup>,
-    receive: Rc<ReceiveGroup>,
     v_layout: QBox<QVBoxLayout>,
-    spectogram: ShittySpectogram,
-    graph: ShittySpectogram,
-    // worker: Worker,
+    device_group: Rc<DeviceGroup>,
+    receive_group: Rc<ReceiveGroup>,
+    output_group: Rc<OutputGroup>,
 
-    device: Rc<RefCell<DeviceManager>>
+    device: Rc<RefCell<DeviceManager>>,
 }
 
 impl App {
@@ -468,50 +542,13 @@ impl App {
 
         let (device_group, group) = DeviceGroup::new(device.clone());
         v_layout.add_widget(group);
-        
-        let (receive, group) = ReceiveGroup::new();
+
+        let (receive_group, group) = ReceiveGroup::new();
         v_layout.add_widget(group);
         v_layout.add_stretch_0a();
 
-        let group2 = QGroupBox::new();
-        let layout2 = QGridLayout::new_0a();
-        layout2.set_size_constraint(SizeConstraint::SetMaximumSize);
-        group2.set_layout(&layout2);
-        h_layout.add_widget(&group2);
-
-        let graph = {
-            let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 0, 0.0..1.0, -2.5..2.5);
-
-            let layout = QVBoxLayout::new_0a();
-            layout.add_widget(widget);
-
-            let group = QGroupBox::new();
-            group.set_layout(&layout);
-            group.set_flat(true);
-            group.set_title(&qs("Signal"));
-
-            layout2.add_widget_3a(&group, 0, 0);
-
-            graph
-        };
-
-        let spectogram = {
-            let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 40, 0.0..1.0, -10.0..150.0);
-
-            let layout = QVBoxLayout::new_0a();
-            layout.add_widget(widget);
-
-            let group = QGroupBox::new();
-            group.set_layout(&layout);
-            group.set_flat(true);
-            group.set_title(&qs("Spectrum"));
-
-            layout2.add_widget_3a(&group, 0, 1);
-
-            graph
-        };
+        let (output_group, group) = OutputGroup::new();
+        h_layout.add_widget(group);
 
         h_layout.add_stretch_0a();
 
@@ -520,12 +557,11 @@ impl App {
         Self {
             root,
             device_group,
-            receive,
-            spectogram,
-            graph,
+            receive_group,
+            output_group,
+
             v_layout,
-            // worker: Worker::new(),
-            device
+            device,
         }
     }
 }
@@ -648,11 +684,13 @@ fn main() {
             //     fft = Some(finished);
             // }
 
-            if let Some(event) = app.device.borrow_mut().try_receive() {
+            if let Some(event) = RefCell::borrow(&app.device).try_receive() {
                 app.device_group.handle_event(&event);
                 match event {
-                    GuiBoundCommand::Error { desc, fatal } => todo!("TODO error handling: {}", desc),
-                    _ => ()
+                    GuiBoundCommand::Error { desc, fatal } => {
+                        todo!("TODO error handling: {}", desc)
+                    }
+                    _ => (),
                 }
             }
         }));
