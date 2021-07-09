@@ -3,7 +3,6 @@
 mod device;
 mod worker;
 mod settings;
-// mod memory_recycler;
 
 use device::{DeviceBoundCommand, DeviceError, DeviceManager, GuiBoundEvent, ValueRanges};
 use qt::QHBoxLayout;
