@@ -2,6 +2,7 @@
 
 mod device;
 mod worker;
+mod settings;
 // mod memory_recycler;
 
 use device::{DeviceBoundCommand, DeviceError, DeviceManager, GuiBoundEvent, ValueRanges};
@@ -39,7 +40,7 @@ use std::{
 };
 use worker::{FinishedMaybe, Worker};
 
-use crate::device::ReceiverState;
+use crate::device::{ReceiverState, RxFormat};
 
 const SAMPLE_COUNT: usize = 256;
 
@@ -197,12 +198,6 @@ impl DeviceGroup {
                     .ok()
                     .unwrap();
 
-                let command = DeviceBoundCommand::RequestData {
-                    data: FftData::new(1024),
-                };
-                s.device.send_command(command.clone());
-                s.device.send_command(command);
-
                 s.b2.set_enabled(false);
                 s.b3.set_enabled(true);
             }
@@ -212,8 +207,6 @@ impl DeviceGroup {
         b3.clicked().connect(&SlotNoArgs::new(group, move || {
             s.b2.set_enabled(true);
             s.b3.set_enabled(false);
-
-            s.device.send_command(DeviceBoundCommand::DestroyDevice);
         }));
 
         // b1.click();
@@ -221,11 +214,15 @@ impl DeviceGroup {
     unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
         match event.as_ref().unwrap() {
             GuiBoundEvent::WorkerReset => {
-                self.combo_box.clear();
+                // self.combo_box.clear(); // it's not very ergonomic to make me click refresh every time the worker crashes 
                 self.b2.set_enabled(false);
                 self.b3.set_enabled(false);
+
+                // force refresh the devices because the worker thread lost it's list of them
+                self.b1.click();
             }
             GuiBoundEvent::RefreshedDevices { list } => {
+                self.b2.set_enabled(true);
                 self.combo_box.clear();
 
                 for name in list {
@@ -236,6 +233,8 @@ impl DeviceGroup {
         };
     }
 }
+
+const DATA_REQUESTS_IN_FLIGHT: usize = 8;
 
 struct ReceiveGroup {
     automatic_update: QBox<QCheckBox>,
@@ -272,15 +271,15 @@ impl ReceiveGroup {
         let samplerate = QDoubleSpinBox::new_0a();
         samplerate.set_suffix(&qs(" MSps"));
         form_layout.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
-        
+
         let frequency = QDoubleSpinBox::new_0a();
         frequency.set_suffix(&qs(" MHz"));
         form_layout.add_row_q_string_q_widget(&qs("Frequency"), &frequency);
-        
+
         let bandwidth = QDoubleSpinBox::new_0a();
         bandwidth.set_suffix(&qs(" MHz"));
         form_layout.add_row_q_string_q_widget(&qs("Bandwidth"), &bandwidth);
-        
+
         let gain = QDoubleSpinBox::new_0a();
         gain.set_suffix(&qs(" dB"));
         form_layout.add_row_q_string_q_widget(&qs("Gain"), &gain);
@@ -333,6 +332,20 @@ impl ReceiveGroup {
 
         self.device
             .send_command(DeviceBoundCommand::SetReceiver(state));
+
+        // this is the first point in program execution where the receiver get actually configured ad is usable,
+        // therefore here we check if there are any existing requests (the configuration was only updated,
+        // not configured for the first time) and if not we inject them to be pingponged between this thread and the worker
+        if self.device.get_data_requests_in_flight() == 0 {
+
+            for i in 0..DATA_REQUESTS_IN_FLIGHT {
+                let command = DeviceBoundCommand::RequestData {
+                    data: FftData::new(1024),
+                };
+    
+                self.device.send_command(command);
+            }
+        }
     }
     unsafe fn init(self: &Rc<Self>) {
         unsafe fn clamp_value(
@@ -763,10 +776,10 @@ impl OutputGroup {
                 let averaged_signal = data
                     .get_input()
                     .chunks(4)
-                    .map(|chunks| chunks.iter().map(|c| c.re).sum::<i16>() as f64 / 4.0);
+                    .map(|chunks| chunks.iter().map(|c| c.re).sum::<RxFormat>() as f64 / 4.0);
                 let averaged_spectrum = data.get_output()[0..(len / 2 + 1)]
                     .chunks(4)
-                    .map(|chunks| chunks.iter().map(|c| c.re).sum::<i16>() as f64 / 4.0);
+                    .map(|chunks| chunks.iter().map(|c| c.re).sum::<RxFormat>() as f64 / 4.0);
 
                 self.signal.add_new_data(averaged_signal, coloring_fn);
                 self.spectrum.add_new_data(averaged_spectrum, coloring_fn);
@@ -836,7 +849,7 @@ impl App {
                 $(
                     if $event.is_some() {
                         $handler.handle_event(&mut $event);
-                    }
+                    } else { return }
                 )+
             }
         }
@@ -930,12 +943,12 @@ fn main() {
                 Ok(Some(GuiBoundEvent::Error { desc, fatal })) => {
                     if fatal {
                         eprintln!(
-                            "Device encountered a fatal error, resetting worker: \n\n{}\n\n",
+                            "Device encountered a fatal error, resetting worker: \n\n{:#?}\n\n",
                             desc
                         );
                         app.reset_worker();
                     } else {
-                        eprintln!("Device encountered an error: \n\n{}\n\n", desc);
+                        eprintln!("Device encountered an error: \n\n{:#?}\n\n", desc);
                     }
                 }
                 Ok(mut event) => {
