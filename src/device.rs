@@ -10,7 +10,6 @@ use std::{
             AtomicBool,
             Ordering::{Acquire, Release},
         },
-        mpsc::{channel, Receiver, Sender, TryRecvError},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -18,11 +17,12 @@ use std::{
     usize,
 };
 
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use rustfft::{
     num_complex::{Complex, Complex64},
     Fft, FftPlanner,
 };
-use soapysdr::{Args, Device, Direction::Rx, Range, RxStream};
+use soapysdr::{Args, Device, Direction::Rx, RxStream, Range};
 
 use crate::FftData;
 
@@ -88,8 +88,8 @@ struct InnerDeviceManager {
 
 impl InnerDeviceManager {
     fn new() -> Self {
-        let (gui_sender_channel, gui_receive_channel) = channel();
-        let (device_sender_channel, device_receive_channel) = channel();
+        let (gui_sender_channel, gui_receive_channel) = crossbeam_channel::unbounded();
+        let (device_sender_channel, device_receive_channel) = crossbeam_channel::unbounded();
 
         let thread = thread::Builder::new()
         .name("Worker thread".to_owned())
@@ -179,8 +179,8 @@ impl InnerDeviceManager {
 }
 
 pub struct DeviceManager(RefCell<InnerDeviceManager>);
-
 impl DeviceManager {
+
     pub fn new() -> Self {
         Self(RefCell::new(InnerDeviceManager::new()))
     }

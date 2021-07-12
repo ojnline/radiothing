@@ -1,7 +1,4 @@
-#![allow(unused)]
-
 mod device;
-mod worker;
 mod settings;
 
 use device::{DeviceBoundCommand, DeviceError, DeviceManager, GuiBoundEvent, ValueRanges};
@@ -37,7 +34,6 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use worker::{FinishedMaybe, Worker};
 
 use crate::device::{ReceiverState, RxFormat};
 
