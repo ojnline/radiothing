@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, fmt::Display, marker::PhantomData, path::Path};
+use std::{collections::HashMap, error::Error, fmt::Display, path::Path};
 
 #[derive(Clone, Debug)]
 pub enum Field {
@@ -31,7 +31,6 @@ impl<'a> CharCursor<'a> {
         s
     }
     fn next(&mut self) -> (usize, char) {
-
         if self.cur.1 == '\n' {
             self.cur_line += 1;
             self.cur_column = 0;
@@ -116,16 +115,18 @@ impl Error for ParseError {}
 
 #[derive(Clone, Debug)]
 pub enum SerializeError {
-    InvalidField {
-        field_name: String
-    },
-    FmtError(std::fmt::Error)
+    InvalidField { field_name: String },
+    FmtError(std::fmt::Error),
 }
 
 impl Display for SerializeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SerializeError::InvalidField {field_name} => writeln!(f, "Tried serializing field '{}' which had an invalid value.", field_name),
+            SerializeError::InvalidField { field_name } => writeln!(
+                f,
+                "Tried serializing field '{}' which had an invalid value.",
+                field_name
+            ),
             SerializeError::FmtError(e) => e.fmt(f),
         }
     }
@@ -162,7 +163,7 @@ impl Settings {
             // if true, the resulting name and field are not added to the hashmap
             // currently only because the name is invalid
             let mut skip = false;
-            
+
             cursor.consume_all(|c| c.is_whitespace());
 
             match cursor.current().1 {
@@ -171,12 +172,12 @@ impl Settings {
                 '#' => {
                     cursor.consume_until('\n');
                     continue;
-                },
+                }
                 _ => {}
             }
-            
+
             // NAME - most unicode is allowed except whitespace, unicode control, punctuation (except '_' and '-')
-            let name = 
+            let name =
             // is a loop only so we can early break here in stable rust, see https://github.com/rust-lang/rust/issues/48594
             'name: loop {
                 let name_start = cursor.current().0;
@@ -197,14 +198,14 @@ impl Settings {
                         },
                         _ => {}
                     }
-                    
-                    if !current.1.is_whitespace() { 
+
+                    if !current.1.is_whitespace() {
                         name_end = current.0 + current.1.len_utf8();
                     }
 
                     cursor.next();
                 }
-                
+
                 let slice = &string.as_bytes()[name_start..name_end];
                 let string = std::str::from_utf8(slice).unwrap();
 
@@ -229,9 +230,9 @@ impl Settings {
             cursor.consume_all(|c| c.is_whitespace());
 
             // VALUE
-            let value = 
+            let value =
             // is a loop only so we can early break here in stable rust, see https://github.com/rust-lang/rust/issues/48594
-            'value: loop {  
+            'value: loop {
                 match cursor.current().1 {
                     // value must be a string, go until we find an unescaped '"'
                     '"' => {
@@ -342,17 +343,22 @@ impl Settings {
     pub fn serialize(&self) -> Result<String, SerializeError> {
         let mut output_string = String::new();
         for (name, value) in &self.fields {
-
             use std::fmt::Write;
             match value {
-                Field::String(string) => writeln!(&mut output_string, "{} = \"{}\"", name, string).map_err(|e| SerializeError::FmtError(e))?,
-                Field::Number(number) => writeln!(&mut output_string, "{} = {}", name, number).map_err(|e| SerializeError::FmtError(e))?,
-                Field::ParseError => return Err(SerializeError::InvalidField{field_name: name.clone()}),
+                Field::String(string) => writeln!(&mut output_string, "{} = \"{}\"", name, string)
+                    .map_err(|e| SerializeError::FmtError(e))?,
+                Field::Number(number) => writeln!(&mut output_string, "{} = {}", name, number)
+                    .map_err(|e| SerializeError::FmtError(e))?,
+                Field::ParseError => {
+                    return Err(SerializeError::InvalidField {
+                        field_name: name.clone(),
+                    })
+                }
             }
         }
 
         Ok(output_string)
-    } 
+    }
     pub fn get_hashmap(&self) -> &HashMap<String, Field> {
         &self.fields
     }
@@ -366,8 +372,7 @@ impl Settings {
 
 #[test]
 fn correct() {
-    let s = 
-    r#"
+    let s = r#"
     #empty line
     
     #comment #another hash
@@ -384,7 +389,7 @@ fn correct() {
     🍎 = "🚀"
     t̷̢̩͈̪̼͈̪̳͔̗̺̺̿͗̋̎̐̈́͌̋͜h̵̡͈̪͚͙̥̤͎̯̼̟̉̍͐̊̿̊͠͝i̶̘̠̬̬͓̗̬̠̬͇̮̞̥͆ś̷̢̛̈̋̃̍̎͆̈́̈̔͌̀̇͝_̶̛̦̘̩͚̦̯̣̮̼̲̩͌̿͑̿͛̔̋͐̀͜i̴̡̛͔̟̣̲̗̦̼͎̗͇͉̠͒͆̈́̈́̉̐́̾͊͊̋̚͘͠s̵̢̨̡̘̣̤̮̤̪̫̀̾̀̄̓̕̕_̴̢̧̲̗̘͍͍̞̱͚̞̦͌̒̓f̴̧̜͗͊̍̋̉̑̕͘͠į̶̫̞͇̭̦̝̼̖͓̥̦̇͊ņ̵̻͍͎̦̖̯̹̞̮̞̇̇̌̏̆̑͆̈́́̂͗͐͜e̴͇͊ = "this_is_fine" #any unicode identifier is allowed except whitespace, control, punctuation (except '_' and '-')
     "#;
-    
+
     let (_settings, errors) = Settings::new(s);
     for e in &errors {
         println!("{}", e);
@@ -397,7 +402,7 @@ fn error() {
     let s = "invalid name with spaces = 1";
     let (_settings, errors) = Settings::new(s);
     assert!(!errors.is_empty());
-    
+
     let s = "number_broke = 1.1.1";
     let (_settings, errors) = Settings::new(s);
     assert!(!errors.is_empty());
@@ -405,15 +410,15 @@ fn error() {
     let s = "forgot=";
     let (_settings, errors) = Settings::new(s);
     assert!(!errors.is_empty());
-    
+
     let s = "forgot";
     let (_settings, errors) = Settings::new(s);
     assert!(!errors.is_empty());
-    
+
     let s = "aaaaaaaaaaaaaa''2";
     let (_settings, errors) = Settings::new(s);
     assert!(!errors.is_empty());
-    
+
     // zalgo with whitespace
     let s = "ẗ̷̜̳͚́͋̃h̵͇̞̩̟̫̅͜i̵̛̘̳̻̍́s̷̢̞͙̿̓͌̉̇̓͑͘ ̵̦̜̌̈́̈́͒̉̒͐̇i̵̯͆͌ś̵̢̛̗̣̜͇͚̼̺̗̳̘͙̲̮̰̈́̅̉̒̑̀͗̈́́̍̊͊ ̵̨̝̮̗͕̽̌̚͝f̵̦̼͎͒̀̈̆̇̌́̚͝ị̷̡̢̧̰̳̲̼̝̺̠̙͓̞̐́͆̌̎̚ņ̶̫̭̘̯̪̰̥͐̃̔̀̌͒̔̈́͂̈͒̈́͜͠͝e̸̜̣̦̲̫͕̎̋̽͒ = \"this is fine\"";
     let (_settings, errors) = Settings::new(s);

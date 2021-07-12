@@ -1,34 +1,20 @@
-use core::f32;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     error::Error,
-    iter::FromIterator,
-    mem::ManuallyDrop,
-    ops::Deref,
-    sync::{
-        atomic::{
-            AtomicBool,
-            Ordering::{Acquire, Release},
-        },
-        Arc, Mutex,
-    },
+    fmt::Display,
     thread::{self, JoinHandle},
-    time::Duration,
     usize,
 };
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use rustfft::{
-    num_complex::{Complex, Complex64},
-    Fft, FftPlanner,
-};
-use soapysdr::{Args, Device, Direction::Rx, RxStream, Range};
+use rustfft::{num_complex::Complex};
+use soapysdr::{Args, Device, Direction::Rx, Range, RxStream};
 
 use crate::FftData;
 
 #[derive(Clone, Debug)]
 pub enum DeviceBoundCommand {
-    DestroyDevice,
+    DestroyDevice, // FIXME is this neccessary
     CreateDevice { index: usize },
     RefreshDevices { args: String },
     SetReceiver(ReceiverState),
@@ -39,9 +25,9 @@ pub enum GuiBoundEvent {
     WorkerReset,
     DeviceCreated { channels_info: Vec<ChannelInfo> },
     DeviceDestroyed,
-    Error { desc: String, fatal: bool },
+    Error(soapysdr::Error),
     RefreshedDevices { list: Vec<String> },
-    DecodedChars { data: String },
+    DecodedChars { data: String }, // TODO
     DataReady { data: FftData<RxFormat> },
 }
 
@@ -92,22 +78,21 @@ impl InnerDeviceManager {
         let (device_sender_channel, device_receive_channel) = crossbeam_channel::unbounded();
 
         let thread = thread::Builder::new()
-        .name("Worker thread".to_owned())
-        .spawn(move || {
-            let worker = DeviceWorker {
-                receiver: device_receive_channel,
-                sender: gui_sender_channel,
-                available_devices: None,
-                device: None,
-                receive_state: None,
-                receive_stream: None,
-                valid_count: 0,
-                working_memory: Box::new([Default::default(); RECEIVE_SIZE]),
-                fft_planner: FftPlanner::new(),
-            };
+            .name("Worker thread".to_owned())
+            .spawn(move || {
+                let worker = DeviceWorker {
+                    receiver: device_receive_channel,
+                    sender: gui_sender_channel,
+                    available_devices: None,
+                    device: None,
+                    receive_state: None,
+                    receive_stream: None,
+                    working_memory: Box::new([Default::default(); RECEIVE_SIZE]),
+                };
 
-            worker.process();
-        }).unwrap();
+                worker.process();
+            })
+            .unwrap();
 
         Self {
             thread,
@@ -152,7 +137,6 @@ impl InnerDeviceManager {
             &DeviceBoundCommand::RequestData { .. } => self.get_data_requests_in_flight += 1,
             DeviceBoundCommand::RefreshDevices { .. } => self.refreshing_devices = true,
             DeviceBoundCommand::SetReceiver(_) => self.receiver_valid = true,
-            _ => (),
         }
 
         self.sender
@@ -180,7 +164,6 @@ impl InnerDeviceManager {
 
 pub struct DeviceManager(RefCell<InnerDeviceManager>);
 impl DeviceManager {
-
     pub fn new() -> Self {
         Self(RefCell::new(InnerDeviceManager::new()))
     }
@@ -209,8 +192,39 @@ impl DeviceManager {
 }
 
 const RECEIVE_SIZE: usize = 16 * 1024;
-const RECEIVE_TIMEOUT_US: i64 = 200_000;  // 200 miliseconds
+const RECEIVE_TIMEOUT_US: i64 = 200_000; // 200 miliseconds
 pub type RxFormat = f32;
+
+#[derive(Clone, Debug)]
+enum DeviceWorkerError {
+    MainThreadTerminated,
+    SoapyError(soapysdr::Error),
+}
+
+impl Display for DeviceWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceWorkerError::MainThreadTerminated => {
+                writeln!(f, "The main thread has terminated before the worker.")
+            }
+            DeviceWorkerError::SoapyError(e) => writeln!(f, "SoapySDR Error: {}", e),
+        }
+    }
+}
+
+impl Error for DeviceWorkerError {}
+
+impl From<soapysdr::Error> for DeviceWorkerError {
+    fn from(error: soapysdr::Error) -> Self {
+        DeviceWorkerError::SoapyError(error)
+    }
+}
+
+impl<T> From<crossbeam_channel::SendError<T>> for DeviceWorkerError {
+    fn from(_: crossbeam_channel::SendError<T>) -> Self {
+        DeviceWorkerError::MainThreadTerminated
+    }
+}
 
 struct DeviceWorker {
     receiver: Receiver<DeviceBoundCommand>,
@@ -222,14 +236,12 @@ struct DeviceWorker {
     receive_state: Option<ReceiverState>,
     receive_stream: Option<RxStream<Complex<RxFormat>>>,
 
-    valid_count: usize,
+    // TODO revamp the way data is read and decoded
     working_memory: Box<[Complex<RxFormat>; RECEIVE_SIZE]>,
-
-    fft_planner: FftPlanner<f64>,
 }
 
 impl DeviceWorker {
-    fn error_process(&mut self) -> Result<(), Box<dyn Error>> {
+    fn error_process(&mut self) -> Result<(), DeviceWorkerError> {
         fn clone_args(a: &Args) -> Args {
             let mut c = Args::new();
             for (k, v) in a {
@@ -240,13 +252,10 @@ impl DeviceWorker {
 
         loop {
             // this will block until there is a command available, this is hopefully implemented with the proper primitives so the thread won't spin the cpu endlessly
-            let event = match self.receiver.recv() {
-                Ok(command) => command,
-                // the sender was closed
-                Err(_) => {
-                    return Ok(());
-                }
-            };
+            let event = self
+                .receiver
+                .recv()
+                .map_err(|_| DeviceWorkerError::MainThreadTerminated)?;
 
             match event {
                 DeviceBoundCommand::CreateDevice { index } => {
@@ -283,7 +292,6 @@ impl DeviceWorker {
                 DeviceBoundCommand::DestroyDevice => {
                     self.receive_stream = None;
                     self.device = None;
-                    self.valid_count = 0;
 
                     self.sender.send(GuiBoundEvent::DeviceDestroyed)?;
                 }
@@ -297,7 +305,7 @@ impl DeviceWorker {
                     self.available_devices = Some(available);
 
                     self.sender
-                        .send(GuiBoundEvent::RefreshedDevices { list: names });
+                        .send(GuiBoundEvent::RefreshedDevices { list: names })?;
                 }
                 DeviceBoundCommand::SetReceiver(state) => {
                     assert!(self.device.is_some());
@@ -352,32 +360,37 @@ impl DeviceWorker {
                 DeviceBoundCommand::RequestData { mut data } => {
                     assert!(self.receive_stream.is_some());
                     assert!(data.get_input().len() <= self.working_memory.len());
-                    
+
                     let len = data.get_input().len();
                     data.get_input_mut()
-                    .copy_from_slice(&mut self.working_memory[0..len]);
+                        .copy_from_slice(&mut self.working_memory[0..len]);
                     data.process();
 
-                    self.sender.send(GuiBoundEvent::DataReady { data });
+                    self.sender.send(GuiBoundEvent::DataReady { data })?;
                 }
             }
 
             if let Some(stream) = self.receive_stream.as_mut() {
-                let read_count = stream.read(&mut [self.working_memory.as_mut()], RECEIVE_TIMEOUT_US)?;
+                let read_count =
+                    stream.read(&mut [self.working_memory.as_mut()], RECEIVE_TIMEOUT_US)?;
                 if read_count != RECEIVE_SIZE {
                     eprintln!("Reading timed out");
                 }
-                self.valid_count = read_count;
             }
         }
     }
     fn process(mut self) {
         loop {
             let result = self.error_process();
-    
-            if let Err(e) = result {
-                let desc = format!("{}", e);
-                self.sender.send(GuiBoundEvent::Error { desc, fatal: false });
+
+            match result {
+                Err(DeviceWorkerError::MainThreadTerminated) => return,
+                Err(DeviceWorkerError::SoapyError(e)) => {
+                    if let Err(_) = self.sender.send(GuiBoundEvent::Error(e)) {
+                        return;
+                    }
+                }
+                _ => unreachable!(), // the error_process() function only ever returns through null coalescing operators and as such always an error
             }
         }
     }

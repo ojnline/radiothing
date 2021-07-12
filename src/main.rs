@@ -5,30 +5,23 @@ use device::{DeviceBoundCommand, DeviceError, DeviceManager, GuiBoundEvent, Valu
 use qt::QHBoxLayout;
 use qt_charts::{
     cpp_core::CppBox,
-    qt_core::{AlignmentFlag, CheckState, QRectF, QTimer, SlotOfBool, SlotOfDouble, SlotOfInt},
+    qt_core::{AlignmentFlag, CheckState, QRectF, QTimer, SlotOfBool, SlotOfInt},
     qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QIcon, QImage, QPixmap},
     *,
 };
 use qt_widgets::{
-    self as qt, q_size_policy::Policy, QApplication, QGridLayout, QGroupBox, QPushButton,
-    QVBoxLayout, QWidget,
+    self as qt, QApplication, QGridLayout, QGroupBox, QPushButton, QVBoxLayout, QWidget,
 };
 use qt_widgets::{cpp_core::Ptr, q_layout::SizeConstraint, QLabel};
 use qt_widgets::{
     qt_core::{qs, QBox, SlotNoArgs},
-    QCheckBox, QDoubleSpinBox, QFormLayout, QSpinBox, QTextEdit,
+    QCheckBox, QDoubleSpinBox, QFormLayout, QTextEdit,
 };
-use rustfft::{
-    num_complex::{Complex, Complex64},
-    num_traits::Zero,
-    Fft, FftNum, FftPlanner,
-};
-use soapysdr::{Args, Device};
+use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftNum, FftPlanner};
+
 use std::{
     borrow::Borrow,
     cell::{Cell, RefCell},
-    convert::TryInto,
-    f64::consts::FRAC_PI_2,
     fmt::{Debug, Formatter},
     ops::Range,
     rc::Rc,
@@ -38,35 +31,6 @@ use std::{
 use crate::device::{ReceiverState, RxFormat};
 
 const SAMPLE_COUNT: usize = 256;
-
-struct Radio {
-    device: Option<Device>,
-    receive_channel: Option<usize>,
-    args: Vec<Args>,
-}
-
-impl Radio {
-    fn new() -> Self {
-        Self {
-            device: None,
-            receive_channel: None,
-            args: Vec::new(),
-        }
-    }
-    fn get_data(&mut self, buffer: &mut [Complex64]) {
-        for (i, s) in buffer.iter_mut().enumerate() {
-            // s.re = (i as f64 * 5.0).sin()
-            fn sin_sum(n: usize, f: f64) -> f64 {
-                (1..=n).into_iter().map(|i| (i as f64 * f).sin()).sum()
-            }
-            let i = i as f64 * 0.2;
-            let r = sin_sum(6, i) * 0.5;
-
-            *s = Complex64::new(r, 0.0);
-            todo!()
-        }
-    }
-}
 
 struct DeviceGroup {
     group: QBox<QGroupBox>,
@@ -119,9 +83,11 @@ impl DeviceGroup {
         let ptr = group.as_ptr();
 
         // send a refresh request once beforehand
-        device.send_command(DeviceBoundCommand::RefreshDevices {
-            args: String::new(),
-        });
+        device
+            .send_command(DeviceBoundCommand::RefreshDevices {
+                args: String::new(),
+            })
+            .unwrap();
 
         let s = Rc::new(Self {
             group,
@@ -148,7 +114,7 @@ impl DeviceGroup {
             b1,
             b2,
             b3,
-            device,
+            device: _,
             ..
         } = self.borrow();
 
@@ -209,7 +175,7 @@ impl DeviceGroup {
     unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
         match event.as_ref().unwrap() {
             GuiBoundEvent::WorkerReset => {
-                // self.combo_box.clear(); // it's not very ergonomic to make me click refresh every time the worker crashes 
+                // self.combo_box.clear(); // it's not very ergonomic to make me click refresh every time the worker crashes
                 self.b2.set_enabled(false);
                 self.b3.set_enabled(false);
 
@@ -326,19 +292,19 @@ impl ReceiveGroup {
         };
 
         self.device
-            .send_command(DeviceBoundCommand::SetReceiver(state));
+            .send_command(DeviceBoundCommand::SetReceiver(state))
+            .unwrap();
 
         // this is the first point in program execution where the receiver get actually configured ad is usable,
         // therefore here we check if there are any existing requests (the configuration was only updated,
         // not configured for the first time) and if not we inject them to be pingponged between this thread and the worker
         if self.device.get_data_requests_in_flight() == 0 {
-
-            for i in 0..DATA_REQUESTS_IN_FLIGHT {
+            for _ in 0..DATA_REQUESTS_IN_FLIGHT {
                 let command = DeviceBoundCommand::RequestData {
                     data: FftData::new(1024),
                 };
-    
-                self.device.send_command(command);
+
+                self.device.send_command(command).unwrap();
             }
         }
     }
@@ -389,8 +355,8 @@ impl ReceiveGroup {
             automatic_dc_offset,
             apply_btn,
             group,
-            value_ranges,
-            device,
+            value_ranges: _,
+            device: _,
         } = self.borrow();
 
         let s = self.clone();
@@ -761,7 +727,7 @@ impl OutputGroup {
     }
     unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
         match event.as_ref().unwrap() {
-            GuiBoundEvent::DecodedChars { data } => todo!(),
+            GuiBoundEvent::DecodedChars { data: _ } => todo!(),
             GuiBoundEvent::DataReady { data } => {
                 unsafe fn coloring_fn(f: f64) -> CppBox<QColor> {
                     QColor::from_rgb_f_3a(f.ln() * 0.2, 0.0, 0.0)
@@ -783,7 +749,8 @@ impl OutputGroup {
                     match event.take().unwrap() {
                         GuiBoundEvent::DataReady { data } => self
                             .device
-                            .send_command(DeviceBoundCommand::RequestData { data }),
+                            .send_command(DeviceBoundCommand::RequestData { data })
+                            .unwrap(),
                         _ => unreachable!(),
                     };
                 }
@@ -859,6 +826,7 @@ impl App {
     }
 }
 
+// TODO the fft can be owned by the worker since the fft length is static
 pub struct FftData<T: FftNum> {
     fft: Arc<dyn Fft<T>>,
     input: Box<[Complex<T>]>,
@@ -927,24 +895,16 @@ impl<T: FftNum> Debug for FftData<T> {
 fn main() {
     QApplication::init(|_| unsafe {
         QApplication::set_window_icon(&QIcon::from_theme_1a(&qs("network-wireless-hotspot")));
-        let mut app = App::new();
+        let app = App::new();
         let timer = QTimer::new_0a();
         timer.set_interval(100);
 
         timer.timeout().connect(&SlotNoArgs::new(&timer, move || {
-            let mut event = app.device.try_receive();
+            let event = app.device.try_receive();
 
             match event {
-                Ok(Some(GuiBoundEvent::Error { desc, fatal })) => {
-                    if fatal {
-                        eprintln!(
-                            "Device encountered a fatal error, resetting worker: \n\n{:#?}\n\n",
-                            desc
-                        );
-                        app.reset_worker();
-                    } else {
-                        eprintln!("Device encountered an error: \n\n{:#?}\n\n", desc);
-                    }
+                Ok(Some(GuiBoundEvent::Error(e))) => {
+                    eprintln!("Device encountered an error: {}", e);
                 }
                 Ok(mut event) => {
                     app.handle_event(&mut event);
