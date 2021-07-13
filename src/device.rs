@@ -3,11 +3,12 @@ use std::{
     error::Error,
     fmt::Display,
     thread::{self, JoinHandle},
+    time::Duration,
     usize,
 };
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use rustfft::{num_complex::Complex};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use rustfft::num_complex::Complex;
 use soapysdr::{Args, Device, Direction::Rx, Range, RxStream};
 
 use crate::FftData;
@@ -51,8 +52,8 @@ pub struct ChannelInfo {
 #[derive(Clone, Debug)]
 pub struct ValueRanges {
     pub samplerate: Vec<Range>,
-    pub bandwidth: Vec<Range>,
     pub frequency: Vec<Range>,
+    pub bandwidth: Vec<Range>,
     pub gain: Range,
 }
 #[derive(Clone, Debug)]
@@ -78,9 +79,6 @@ impl Display for WorkerPoisoned {
     }
 }
 impl Error for WorkerPoisoned {}
-
-
-
 
 struct InnerDeviceManager {
     thread: JoinHandle<()>,
@@ -273,66 +271,70 @@ impl DeviceWorker {
 
         loop {
             // this will block until there is a command available, this is hopefully implemented with the proper primitives so the thread won't spin the cpu endlessly
-            let event = self
-                .receiver
-                .recv()
-                .map_err(|_| DeviceWorkerError::MainThreadTerminated)?;
+            let event = match self.receiver.recv_timeout(Duration::from_millis(2)) {
+                Ok(event) => Some(event),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(DeviceWorkerError::MainThreadTerminated)
+                }
+            };
 
-            match event {
-                DeviceBoundCommand::CreateDevice { index } => {
-                    assert!(self.device.is_none());
-                    assert!(self.available_devices.is_some());
+            if let Some(event) = event {
+                match event {
+                    DeviceBoundCommand::CreateDevice { index } => {
+                        assert!(self.device.is_none());
+                        assert!(self.available_devices.is_some());
 
-                    let args = clone_args(&self.available_devices.as_ref().unwrap()[index]);
-                    let dev = Device::new(args)?;
+                        let args = clone_args(&self.available_devices.as_ref().unwrap()[index]);
+                        let dev = Device::new(args)?;
 
-                    let num_channels = dev.num_channels(Rx)?;
-                    let mut channels_info = Vec::with_capacity(num_channels as usize);
+                        let num_channels = dev.num_channels(Rx)?;
+                        let mut channels_info = Vec::with_capacity(num_channels as usize);
 
-                    for i in 0..dev.num_channels(Rx)? {
-                        let info = dev
-                            .channel_info(Rx, i)?
-                            .into_iter()
-                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                        for i in 0..dev.num_channels(Rx)? {
+                            let info = dev
+                                .channel_info(Rx, i)?
+                                .into_iter()
+                                .map(|(key, value)| (key.to_string(), value.to_string()))
+                                .collect();
+
+                            let ranges = ValueRanges {
+                                samplerate: dev.get_sample_rate_range(Rx, i)?,
+                                bandwidth: dev.bandwidth_range(Rx, i)?,
+                                frequency: dev.frequency_range(Rx, i)?,
+                                gain: dev.gain_range(Rx, i)?,
+                            };
+
+                            channels_info.push(ChannelInfo { ranges, info })
+                        }
+
+                        self.sender
+                            .send(GuiBoundEvent::DeviceCreated { channels_info })?;
+                        self.device = Some(dev);
+                    }
+                    DeviceBoundCommand::DestroyDevice => {
+                        self.receive_stream = None;
+                        self.device = None;
+
+                        self.sender.send(GuiBoundEvent::DeviceDestroyed)?;
+                    }
+                    DeviceBoundCommand::RefreshDevices { args } => {
+                        let available = soapysdr::enumerate(args.as_str())?;
+                        let names = available
+                            .iter()
+                            .map(|d| d.get("label").unwrap().to_owned())
                             .collect();
 
-                        let ranges = ValueRanges {
-                            samplerate: dev.get_sample_rate_range(Rx, i)?,
-                            bandwidth: dev.bandwidth_range(Rx, i)?,
-                            frequency: dev.frequency_range(Rx, i)?,
-                            gain: dev.gain_range(Rx, i)?,
-                        };
+                        self.available_devices = Some(available);
 
-                        channels_info.push(ChannelInfo { ranges, info })
+                        self.sender
+                            .send(GuiBoundEvent::RefreshedDevices { list: names })?;
                     }
+                    DeviceBoundCommand::SetReceiver(state) => {
+                        assert!(self.device.is_some());
 
-                    self.sender
-                        .send(GuiBoundEvent::DeviceCreated { channels_info })?;
-                    self.device = Some(dev);
-                }
-                DeviceBoundCommand::DestroyDevice => {
-                    self.receive_stream = None;
-                    self.device = None;
-
-                    self.sender.send(GuiBoundEvent::DeviceDestroyed)?;
-                }
-                DeviceBoundCommand::RefreshDevices { args } => {
-                    let available = soapysdr::enumerate(args.as_str())?;
-                    let names = available
-                        .iter()
-                        .map(|d| d.get("label").unwrap().to_owned())
-                        .collect();
-
-                    self.available_devices = Some(available);
-
-                    self.sender
-                        .send(GuiBoundEvent::RefreshedDevices { list: names })?;
-                }
-                DeviceBoundCommand::SetReceiver(state) => {
-                    assert!(self.device.is_some());
-
-                    // compares the new state to the one currently set and if they differ (or the previous state is unset, this is why it's so ugly) run the block
-                    macro_rules! if_differs {
+                        // compares the new state to the one currently set and if they differ (or the previous state is unset, this is why it's so ugly) run the block
+                        macro_rules! if_differs {
                         ($($var:ident, $then:expr);+ $(;)?) => {
                             $(
                                 if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
@@ -343,51 +345,52 @@ impl DeviceWorker {
                         }
                     }
 
-                    let ReceiverState {
-                        channel,
-                        samplerate,
-                        frequency,
-                        bandwidth,
-                        gain,
-                        automatic_gain,
-                        automatic_dc_offset,
-                    } = state.clone();
+                        let ReceiverState {
+                            channel,
+                            samplerate,
+                            frequency,
+                            bandwidth,
+                            gain,
+                            automatic_gain,
+                            automatic_dc_offset,
+                        } = state.clone();
 
-                    let dev = self.device.as_ref().unwrap();
+                        let dev = self.device.as_ref().unwrap();
 
-                    let mut antennas = dbg!(dev.antennas(Rx, channel)?);
-                    dev.set_antenna(
-                        Rx,
-                        channel,
-                        antennas.pop().expect("No receiving antennas on channel."),
-                    )?;
+                        let mut antennas = dbg!(dev.antennas(Rx, channel)?);
+                        dev.set_antenna(
+                            Rx,
+                            channel,
+                            antennas.pop().expect("No receiving antennas on channel."),
+                        )?;
 
-                    // this is the result of excessive bikeshedding
-                    if_differs!(
-                        gain,       dev.set_gain(Rx, channel, gain)?;
-                        frequency,  dev.set_frequency(Rx, channel, frequency, ())?; // FIXME are the args neccessary for anything?
-                        samplerate, dev.set_sample_rate(Rx, channel, samplerate)?;
-                        bandwidth,  dev.set_bandwidth(Rx, channel, bandwidth)?;
-                        automatic_gain, dev.set_gain_mode(Rx, channel, automatic_gain)?;
-                        automatic_dc_offset, dev.set_dc_offset_mode(Rx, channel, automatic_dc_offset)?;
-                        channel, {
-                            self.receive_stream = None;
-                            let mut new_receiver = dev.rx_stream::<Complex<RxFormat>>(&[channel])?;
-                            new_receiver.activate(None)?;
-                            self.receive_stream = Some(new_receiver);
-                        };
-                    );
-                }
-                DeviceBoundCommand::RequestData { mut data } => {
-                    assert!(self.receive_stream.is_some());
-                    assert!(data.get_input().len() <= self.working_memory.len());
+                        // this is the result of excessive bikeshedding
+                        if_differs!(
+                            gain,       dev.set_gain(Rx, channel, gain)?;
+                            frequency,  dev.set_frequency(Rx, channel, frequency, ())?; // FIXME are the args neccessary for anything?
+                            samplerate, dev.set_sample_rate(Rx, channel, samplerate)?;
+                            bandwidth,  dev.set_bandwidth(Rx, channel, bandwidth)?;
+                            automatic_gain, dev.set_gain_mode(Rx, channel, automatic_gain)?;
+                            automatic_dc_offset, dev.set_dc_offset_mode(Rx, channel, automatic_dc_offset)?;
+                            channel, {
+                                self.receive_stream = None;
+                                let mut new_receiver = dev.rx_stream::<Complex<RxFormat>>(&[channel])?;
+                                new_receiver.activate(None)?;
+                                self.receive_stream = Some(new_receiver);
+                            };
+                        );
+                    }
+                    DeviceBoundCommand::RequestData { mut data } => {
+                        assert!(self.receive_stream.is_some());
+                        assert!(data.get_input().len() <= self.working_memory.len());
 
-                    let len = data.get_input().len();
-                    data.get_input_mut()
-                        .copy_from_slice(&mut self.working_memory[0..len]);
-                    data.process();
+                        let len = data.get_input().len();
+                        data.get_input_mut()
+                            .copy_from_slice(&mut self.working_memory[0..len]);
+                        data.process();
 
-                    self.sender.send(GuiBoundEvent::DataReady { data })?;
+                        self.sender.send(GuiBoundEvent::DataReady { data })?;
+                    }
                 }
             }
 

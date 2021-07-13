@@ -2,15 +2,15 @@ mod device;
 mod settings;
 
 use device::{DeviceBoundCommand, DeviceError, DeviceManager, GuiBoundEvent, ValueRanges};
-use qt::QHBoxLayout;
 use qt_charts::{
     cpp_core::CppBox,
     qt_core::{AlignmentFlag, CheckState, QRectF, QTimer, SlotOfBool, SlotOfInt},
-    qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QIcon, QImage, QPixmap},
+    qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QImage, QPixmap},
     *,
 };
 use qt_widgets::{
-    self as qt, QApplication, QGridLayout, QGroupBox, QPushButton, QVBoxLayout, QWidget,
+    self as qt, QApplication, QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QLineEdit,
+    QPushButton, QSpinBox, QVBoxLayout, QWidget,
 };
 use qt_widgets::{cpp_core::Ptr, q_layout::SizeConstraint, QLabel};
 use qt_widgets::{
@@ -47,13 +47,13 @@ const SAMPLE_COUNT: usize = 256;
 #[allow(unused)]
 struct DeviceGroup {
     group: QBox<QGroupBox>,
-    combo_box: QBox<qt::QComboBox>,
+    combo_box: QBox<QComboBox>,
     auto_select: QBox<QCheckBox>,
-    entry: QBox<qt::QLineEdit>,
+    entry: QBox<QLineEdit>,
     row_widget: QBox<QWidget>,
-    b1: QBox<qt::QPushButton>,
-    b2: QBox<qt::QPushButton>,
-    b3: QBox<qt::QPushButton>,
+    b1: QBox<QPushButton>,
+    b2: QBox<QPushButton>,
+    b3: QBox<QPushButton>,
 
     device: Rc<DeviceManager>,
 }
@@ -69,10 +69,10 @@ impl DeviceGroup {
         auto_select.set_text(&qs("Auto select device"));
         layout.add_widget(&auto_select);
 
-        let entry = qt::QLineEdit::new();
+        let entry = QLineEdit::new();
         entry.set_placeholder_text(&qs("Device filter"));
 
-        let combo_box = qt::QComboBox::new_0a();
+        let combo_box = QComboBox::new_0a();
 
         let row_widget = QWidget::new_0a();
         let row_layout = qt::QHBoxLayout::new_1a(&row_widget);
@@ -142,7 +142,7 @@ impl DeviceGroup {
             .current_index_changed()
             .connect(&SlotNoArgs::new(group, move || {
                 let enabled = (s.combo_box.count() != 0) && !s.device.get_device_valid();
-                s.b2.set_enabled(enabled)
+                s.b2.set_enabled(enabled);
             }));
 
         let s = self.clone();
@@ -174,7 +174,8 @@ impl DeviceGroup {
 
         let s = self.clone();
         b3.clicked().connect(&SlotNoArgs::new(group, move || {
-            s.b2.set_enabled(true);
+            handle_send_result(s.device.send_command(DeviceBoundCommand::DestroyDevice));
+
             s.b3.set_enabled(false);
         }));
 
@@ -191,7 +192,6 @@ impl DeviceGroup {
                 self.b1.click();
             }
             GuiBoundEvent::RefreshedDevices { list } => {
-                self.b2.set_enabled(true);
                 self.combo_box.clear();
 
                 for name in list {
@@ -205,17 +205,27 @@ impl DeviceGroup {
 
 const DATA_REQUESTS_IN_FLIGHT: usize = 8;
 
+enum Samplerate {
+    Ranges(QBox<QDoubleSpinBox>),
+    Values(QBox<QComboBox>),
+}
+
 struct ReceiveGroup {
     automatic_update: QBox<QCheckBox>,
-    samplerate: QBox<QDoubleSpinBox>,
     frequency: QBox<QDoubleSpinBox>,
-    bandwidth: QBox<QDoubleSpinBox>,
+    // most devices provide only a set of valid values for samplerate
+    // some are able to cover a range though, :(
+    samplerate: RefCell<Samplerate>,
     gain: QBox<QDoubleSpinBox>,
+    // some devices, for example RTL-SDR, do not allow setting bandwidth
+    // currently it set if the valid bandwith range returned by the device is empty
+    bandwidth_available: Cell<bool>,
     automatic_gain: QBox<QCheckBox>,
     automatic_dc_offset: QBox<QCheckBox>,
     apply_btn: QBox<QPushButton>,
 
     group: QBox<QGroupBox>,
+    form_layout: QBox<QFormLayout>,
 
     value_ranges: RefCell<Option<ValueRanges>>,
     device: Rc<DeviceManager>,
@@ -234,20 +244,15 @@ impl ReceiveGroup {
 
         let form_layout = QFormLayout::new_0a();
         v.add_layout_1a(&form_layout);
-        // layout.set_size_constraint(SizeConstraint::SetFixedSize);
         group.set_layout(&v);
-
-        let samplerate = QDoubleSpinBox::new_0a();
-        samplerate.set_suffix(&qs(" MSps"));
-        form_layout.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
 
         let frequency = QDoubleSpinBox::new_0a();
         frequency.set_suffix(&qs(" MHz"));
         form_layout.add_row_q_string_q_widget(&qs("Frequency"), &frequency);
 
-        let bandwidth = QDoubleSpinBox::new_0a();
-        bandwidth.set_suffix(&qs(" MHz"));
-        form_layout.add_row_q_string_q_widget(&qs("Bandwidth"), &bandwidth);
+        let samplerate = QDoubleSpinBox::new_0a();
+        samplerate.set_suffix(&qs(" MSps"));
+        form_layout.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
 
         let gain = QDoubleSpinBox::new_0a();
         gain.set_suffix(&qs(" dB"));
@@ -266,14 +271,15 @@ impl ReceiveGroup {
         let ptr = group.as_ptr();
         let s = Rc::new(Self {
             automatic_update,
-            samplerate,
+            samplerate: RefCell::new(Samplerate::Ranges(samplerate)),
             frequency,
-            bandwidth,
+            bandwidth_available: Cell::new(true),
             gain,
             automatic_gain,
             automatic_dc_offset,
             apply_btn,
             group,
+            form_layout,
 
             value_ranges: RefCell::new(None),
             device,
@@ -288,12 +294,30 @@ impl ReceiveGroup {
         // everything is in megahertz or megasamples/second
         const MIL: f64 = 1_000_000.0;
 
+        let samplerate = match &*self.samplerate.borrow() {
+            Samplerate::Ranges(spinbox) => spinbox.value(),
+            // in the case of only discreet values being available, minimum==maximum
+            // simply get it from the Range minimum
+            Samplerate::Values(combox) => {
+                self.value_ranges.borrow().as_ref().unwrap().samplerate
+                    [combox.current_index() as usize]
+                    .minimum
+            }
+        };
+
         let state = ReceiverState {
             // TODO channel is hardcoded for now, it seems it is not too useful to be able to specify it, at least on my device
             channel: 0,
-            samplerate: self.samplerate.value() * MIL,
+            samplerate: samplerate * MIL,
             frequency: self.frequency.value() * MIL,
-            bandwidth: self.bandwidth.value() * MIL,
+            // set bandwidth to 75% of samplerate, seems to work fine for OsmoSDR
+            // https://github.com/osmocom/gr-osmosdr/blob/e5bee0820f493d2ff048ba4ed18be4d0c7976a87/lib/soapy/soapy_sink_c.cc#L297
+            // hopefully the driver is fine with rounding it to an available value, it is possible to be more smart about it
+            bandwidth: if self.bandwidth_available.get() {
+                samplerate * MIL * 0.75
+            } else {
+                0.0
+            },
             gain: self.gain.value(),
             automatic_gain: self.automatic_gain.is_checked(),
             automatic_dc_offset: self.automatic_dc_offset.is_checked(),
@@ -318,54 +342,15 @@ impl ReceiveGroup {
         }
     }
     unsafe fn init(self: &Rc<Self>) {
-        unsafe fn clamp_value(
-            widget: &QBox<QDoubleSpinBox>,
-            ranges: &mut dyn Iterator<Item = &soapysdr::Range>,
-        ) {
-            let mut val = widget.value();
-
-            // this seems pretty robust however it is quite spaghetti so it is very much possible there is an off-by-one error
-            let mut previous_edge = 0.0;
-            let mut first = true;
-            for range in ranges {
-                // make sure to check against the start of the first range
-                if first {
-                    val = val.max(range.minimum);
-                    first = false;
-                }
-
-                // if the value is inside the valid range, snap it a multiple of step
-                if (range.minimum..=range.maximum).contains(&val) {
-                    // if the step is 0 or some small value, this doesn't work
-                    // let step = range.step.min(0.0001);
-                    // val = (val / step).trunc() * step;
-
-                    // it seems that the device round is itself which I assume is better
-                }
-                // if the value is between the previous maximum and the current minimum it is not a valid range, therefore we snap it to the previous maximum
-                else if (previous_edge..=(range.minimum)).contains(&val) {
-                    val = previous_edge;
-                }
-                previous_edge = range.maximum;
-            }
-            // make sure to also check the end of the last range
-            val = val.min(previous_edge);
-
-            widget.set_value(val);
-        }
-
         let Self {
             automatic_update,
-            samplerate,
             frequency,
-            bandwidth,
             gain,
             automatic_gain,
             automatic_dc_offset,
             apply_btn,
             group,
-            value_ranges: _,
-            device: _,
+            ..
         } = self.borrow();
 
         let s = self.clone();
@@ -373,8 +358,11 @@ impl ReceiveGroup {
             .state_changed()
             .connect(&SlotOfInt::new(group, move |state| {
                 let enabled = state == CheckState::Unchecked.into() && s.device.get_device_valid();
-
                 s.apply_btn.set_enabled(enabled);
+
+                if state == CheckState::Checked.into() {
+                    s.values_changed();
+                }
             }));
 
         // another extremely bikeshedded (bikeshad?) macro
@@ -396,9 +384,8 @@ impl ReceiveGroup {
             };
         }
 
-        setup_values_changed! {samplerate, std::iter::IntoIterator::into_iter};
+        // setup_values_changed! {samplerate, std::iter::IntoIterator::into_iter};
         setup_values_changed! {frequency, std::iter::IntoIterator::into_iter};
-        setup_values_changed! {bandwidth, std::iter::IntoIterator::into_iter};
         setup_values_changed! {gain, std::iter::once};
 
         let s = self.clone();
@@ -419,33 +406,89 @@ impl ReceiveGroup {
             }));
     }
 
-    unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
+    unsafe fn handle_event(self: &Rc<Self>, event: &mut Option<GuiBoundEvent>) {
         {
             let enabled = self.device.get_device_valid();
             self.group.set_enabled(enabled);
         }
 
         match event.as_ref().unwrap() {
+            // it is incredibly ugly to be doing this replacement here and everytime the device changes
+            // but this wouldn't be a gui project without bad code
             GuiBoundEvent::DeviceCreated { channels_info } => {
-                let ranges = channels_info[0].ranges.clone();
+                let mut ranges = channels_info[0].ranges.clone();
 
                 // everything is in megahertz or megasamples/second
                 const MIL: f64 = 1_000_000.0;
 
-                // NaN fun
-                let min = ranges
-                    .samplerate
-                    .iter()
-                    .map(|r| r.minimum)
-                    .min_by(|a, b| a.partial_cmp(b).unwrap())
-                    .unwrap();
-                let max = ranges
-                    .samplerate
-                    .iter()
-                    .map(|r| r.maximum)
-                    .max_by(|a, b| a.partial_cmp(b).unwrap())
-                    .unwrap();
-                self.samplerate.set_range(min / MIL, max / MIL);
+                self.form_layout.remove_row_int(1);
+
+                // the device supports only discreet samplerates
+                if ranges.samplerate[0].minimum == ranges.samplerate[0].maximum {
+                    let combox = QComboBox::new_0a();
+
+                    for range in &ranges.samplerate {
+                        let label = format!("{} MSps", range.minimum / MIL);
+                        combox.add_item_q_string(&qs(label));
+                    }
+
+                    let s = self.clone();
+                    combox
+                        .current_index_changed()
+                        .connect(&SlotNoArgs::new(&combox, move || {
+                            if s.automatic_update.is_checked() {
+                                s.values_changed();
+                            }
+                        }));
+
+                    self.form_layout.insert_row_int_q_string_q_widget(
+                        1,
+                        &qs("Samplerate"),
+                        &combox,
+                    );
+                    self.samplerate.replace(Samplerate::Values(combox));
+                } else {
+                    // NaN fun
+                    let min = ranges
+                        .samplerate
+                        .iter()
+                        .map(|r| r.minimum)
+                        .min_by(|a, b| a.partial_cmp(b).unwrap())
+                        .unwrap();
+                    let max = ranges
+                        .samplerate
+                        .iter()
+                        .map(|r| r.maximum)
+                        .max_by(|a, b| a.partial_cmp(b).unwrap())
+                        .unwrap();
+
+                    let spinbox = QDoubleSpinBox::new_0a();
+                    spinbox.set_range(min / MIL, max / MIL);
+
+                    let s = self.clone();
+                    spinbox
+                        .editing_finished()
+                        .connect(&SlotNoArgs::new(&spinbox, move || {
+                            let ranges = s.value_ranges.borrow_mut();
+                            let r = &ranges.as_ref().unwrap().samplerate;
+
+                            match &*s.samplerate.borrow() {
+                                Samplerate::Ranges(spinbox) => clamp_value(&spinbox, &mut r.iter()),
+                                Samplerate::Values(_) => unreachable!(),
+                            }
+
+                            if s.automatic_update.is_checked() {
+                                s.values_changed();
+                            }
+                        }));
+
+                    self.form_layout.insert_row_int_q_string_q_widget(
+                        1,
+                        &qs("Samplerate"),
+                        &spinbox,
+                    );
+                    self.samplerate.replace(Samplerate::Ranges(spinbox));
+                }
 
                 let min = ranges
                     .frequency
@@ -461,29 +504,67 @@ impl ReceiveGroup {
                     .unwrap();
                 self.frequency.set_range(min / MIL, max / MIL);
 
-                let min = ranges
-                    .bandwidth
-                    .iter()
-                    .map(|r| r.minimum)
-                    .min_by(|a, b| a.partial_cmp(b).unwrap())
-                    .unwrap();
-                let max = ranges
-                    .bandwidth
-                    .iter()
-                    .map(|r| r.maximum)
-                    .max_by(|a, b| a.partial_cmp(b).unwrap())
-                    .unwrap();
-                self.bandwidth.set_range(min / MIL, max / MIL);
+                self.bandwidth_available.set(!ranges.bandwidth.is_empty());
 
                 let min = ranges.gain.minimum;
                 let max = ranges.gain.maximum;
                 self.gain.set_range(min, max);
+
+                fn scale_to_mega(ranges: &mut Vec<soapysdr::Range>) {
+                    ranges.iter_mut().for_each(|s| {
+                        s.minimum /= MIL;
+                        s.maximum /= MIL;
+                        s.step /= MIL
+                    });
+                }
+
+                // scale the ranges so that they match the displayed units
+                scale_to_mega(&mut ranges.samplerate);
+                scale_to_mega(&mut ranges.frequency);
+                scale_to_mega(&mut ranges.bandwidth);
 
                 *self.value_ranges.borrow_mut() = Some(ranges);
             }
             _ => (),
         }
     }
+}
+
+// a helper function for ReceiveGroup to clamp the configured parameters to valid ranges
+unsafe fn clamp_value(
+    widget: &QBox<QDoubleSpinBox>,
+    ranges: &mut dyn Iterator<Item = &soapysdr::Range>,
+) {
+    let mut val = widget.value();
+
+    // this seems pretty robust however it is quite spaghetti so it is very much possible there is an off-by-one error
+    let mut previous_edge = 0.0;
+    let mut first = true;
+    for range in ranges {
+        // make sure to check against the start of the first range
+        if first {
+            val = val.max(range.minimum);
+            first = false;
+        }
+
+        // if the value is inside the valid range, snap it a multiple of step
+        if (range.minimum..=range.maximum).contains(&val) {
+            // if the step is 0 or some small value, this doesn't work
+            // let step = range.step.min(0.0001);
+            // val = (val / step).trunc() * step;
+
+            // it seems that the device round is itself which I assume is better
+        }
+        // if the value is between the previous maximum and the current minimum it is not a valid range, therefore we snap it to the previous maximum
+        else if (previous_edge..=(range.minimum)).contains(&val) {
+            val = previous_edge;
+        }
+        previous_edge = range.maximum;
+    }
+    // make sure to also check the end of the last range
+    val = val.min(previous_edge);
+
+    widget.set_value(val);
 }
 
 #[allow(unused)]
@@ -604,11 +685,6 @@ impl ShittySpectogram {
         self.frequency_samples.set(count);
     }
 
-    unsafe fn set_history_count(&self, count: u32) {
-        self.recreate_image.set(true);
-        self.spectogram_history_count.set(count);
-    }
-
     // resize and clear image
     unsafe fn recreate_image(&self) {
         let new_image = QImage::from_2_int_format(
@@ -664,6 +740,11 @@ impl ShittySpectogram {
                 self.series.append_2_double(d_x * i as f64, p);
             }
         }
+    }
+
+    unsafe fn clear(&self) {
+        self.series.clear();
+        self.pixlabel.clear();
     }
 }
 
@@ -739,6 +820,11 @@ impl OutputGroup {
     }
     unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
         match event.as_ref().unwrap() {
+            GuiBoundEvent::DeviceCreated { .. } => {
+                self.signal.clear();
+                self.spectrum.clear();
+                self.text_edit.clear();
+            }
             GuiBoundEvent::DecodedChars { data: _ } => todo!(),
             GuiBoundEvent::DataReady { data } => {
                 unsafe fn coloring_fn(f: f64) -> CppBox<QColor> {
@@ -907,7 +993,6 @@ impl<T: FftNum> Debug for FftData<T> {
 
 fn main() {
     QApplication::init(|_| unsafe {
-        QApplication::set_window_icon(&QIcon::from_theme_1a(&qs("network-wireless-hotspot")));
         let app = App::new();
         let timer = QTimer::new_0a();
         timer.set_interval(100);
