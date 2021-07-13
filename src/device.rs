@@ -55,11 +55,32 @@ pub struct ValueRanges {
     pub frequency: Vec<Range>,
     pub gain: Range,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum DeviceError {
     BadState,
     WorkerPoisoned,
 }
+impl Display for DeviceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceError::BadState => writeln!(f, "The application is in a bad state."),
+            DeviceError::WorkerPoisoned => writeln!(f, "The receive thread has panicked."),
+        }
+    }
+}
+impl Error for DeviceError {}
+
+#[derive(Clone, Debug)]
+pub struct WorkerPoisoned;
+impl Display for WorkerPoisoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "The receive thread has panicked.")
+    }
+}
+impl Error for WorkerPoisoned {}
+
+
+
 
 struct InnerDeviceManager {
     thread: JoinHandle<()>,
@@ -143,7 +164,7 @@ impl InnerDeviceManager {
             .send(command)
             .map_err(|_| DeviceError::WorkerPoisoned)
     }
-    fn try_receive(&mut self) -> Result<Option<GuiBoundEvent>, DeviceError> {
+    fn try_receive(&mut self) -> Result<Option<GuiBoundEvent>, WorkerPoisoned> {
         let event = self.receiver.try_recv();
 
         if let Ok(event) = event.as_ref() {
@@ -156,7 +177,7 @@ impl InnerDeviceManager {
 
         match event {
             Ok(event) => return Ok(Some(event)),
-            Err(TryRecvError::Disconnected) => return Err(DeviceError::WorkerPoisoned),
+            Err(TryRecvError::Disconnected) => return Err(WorkerPoisoned),
             Err(TryRecvError::Empty) => return Ok(None),
         }
     }
@@ -182,7 +203,7 @@ impl DeviceManager {
     pub fn send_command(&self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
         self.0.borrow_mut().send_command(command)
     }
-    pub fn try_receive(&self) -> Result<Option<GuiBoundEvent>, DeviceError> {
+    pub fn try_receive(&self) -> Result<Option<GuiBoundEvent>, WorkerPoisoned> {
         self.0.borrow_mut().try_receive()
     }
 

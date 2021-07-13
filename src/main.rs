@@ -30,8 +30,21 @@ use std::{
 
 use crate::device::{ReceiverState, RxFormat};
 
+// crash on BadState, ignore WorkerPoisoned because it will be handled in the next iteration
+// previously the code ws just unwrapping the result which enabled a race condition when the worker thread has just closed
+// obviously on a bad state we want to crash regardless but a panic is a much nicer error
+fn handle_send_result(result: Result<(), DeviceError>) {
+    match result {
+        Err(DeviceError::BadState) => {
+            panic!("Application is in the wrong state, this is a fatal error, shutting down");
+        }
+        Err(DeviceError::WorkerPoisoned) | Ok(()) => {}
+    }
+}
+
 const SAMPLE_COUNT: usize = 256;
 
+#[allow(unused)]
 struct DeviceGroup {
     group: QBox<QGroupBox>,
     combo_box: QBox<qt::QComboBox>,
@@ -83,11 +96,9 @@ impl DeviceGroup {
         let ptr = group.as_ptr();
 
         // send a refresh request once beforehand
-        device
-            .send_command(DeviceBoundCommand::RefreshDevices {
-                args: String::new(),
-            })
-            .unwrap();
+        handle_send_result(device.send_command(DeviceBoundCommand::RefreshDevices {
+            args: String::new(),
+        }));
 
         let s = Rc::new(Self {
             group,
@@ -140,10 +151,10 @@ impl DeviceGroup {
             if !s.device.get_refreshing_devices() {
                 let filter = s.entry.text().to_std_string();
 
-                s.device
-                    .send_command(DeviceBoundCommand::RefreshDevices { args: filter })
-                    .ok()
-                    .unwrap();
+                handle_send_result(
+                    s.device
+                        .send_command(DeviceBoundCommand::RefreshDevices { args: filter }),
+                );
             }
         }));
 
@@ -152,12 +163,9 @@ impl DeviceGroup {
             if s.combo_box.count() != 0 {
                 let index = s.combo_box.current_index();
 
-                s.device
-                    .send_command(DeviceBoundCommand::CreateDevice {
-                        index: index as usize,
-                    })
-                    .ok()
-                    .unwrap();
+                handle_send_result(s.device.send_command(DeviceBoundCommand::CreateDevice {
+                    index: index as usize,
+                }));
 
                 s.b2.set_enabled(false);
                 s.b3.set_enabled(true);
@@ -291,9 +299,10 @@ impl ReceiveGroup {
             automatic_dc_offset: self.automatic_dc_offset.is_checked(),
         };
 
-        self.device
-            .send_command(DeviceBoundCommand::SetReceiver(state))
-            .unwrap();
+        handle_send_result(
+            self.device
+                .send_command(DeviceBoundCommand::SetReceiver(state)),
+        );
 
         // this is the first point in program execution where the receiver get actually configured ad is usable,
         // therefore here we check if there are any existing requests (the configuration was only updated,
@@ -304,7 +313,7 @@ impl ReceiveGroup {
                     data: FftData::new(1024),
                 };
 
-                self.device.send_command(command).unwrap();
+                handle_send_result(self.device.send_command(command));
             }
         }
     }
@@ -477,6 +486,7 @@ impl ReceiveGroup {
     }
 }
 
+#[allow(unused)]
 struct ShittySpectogram {
     graph_width: Cell<u32>,
     graph_height: Cell<u32>,
@@ -656,6 +666,8 @@ impl ShittySpectogram {
         }
     }
 }
+
+#[allow(unused)]
 struct OutputGroup {
     group: QBox<QGroupBox>,
     grid: QBox<QGridLayout>,
@@ -747,10 +759,10 @@ impl OutputGroup {
 
                 if self.device.get_receiver_valid() {
                     match event.take().unwrap() {
-                        GuiBoundEvent::DataReady { data } => self
-                            .device
-                            .send_command(DeviceBoundCommand::RequestData { data })
-                            .unwrap(),
+                        GuiBoundEvent::DataReady { data } => handle_send_result(
+                            self.device
+                                .send_command(DeviceBoundCommand::RequestData { data }),
+                        ),
                         _ => unreachable!(),
                     };
                 }
@@ -760,6 +772,7 @@ impl OutputGroup {
     }
 }
 
+#[allow(unused)]
 struct App {
     root: QBox<QWidget>,
     v_layout: QBox<QVBoxLayout>,
@@ -909,10 +922,7 @@ fn main() {
                 Ok(mut event) => {
                     app.handle_event(&mut event);
                 }
-                Err(DeviceError::BadState) => panic!(
-                    "Application is in the wrong state, this is a fatal error, shutting down"
-                ),
-                Err(DeviceError::WorkerPoisoned) => {
+                Err(_) => {
                     eprintln!("The receiver worker thread has panicked, resetting worker");
 
                     app.reset_worker();
