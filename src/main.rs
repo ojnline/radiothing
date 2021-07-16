@@ -10,7 +10,7 @@ use qt_charts::{
 };
 use qt_widgets::{
     self as qt, QApplication, QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QLineEdit,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QPushButton, QVBoxLayout, QWidget,
 };
 use qt_widgets::{cpp_core::Ptr, q_layout::SizeConstraint, QLabel};
 use qt_widgets::{
@@ -18,7 +18,6 @@ use qt_widgets::{
     QCheckBox, QDoubleSpinBox, QFormLayout, QTextEdit,
 };
 use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftNum, FftPlanner};
-
 use std::{
     borrow::Borrow,
     cell::{Cell, RefCell},
@@ -377,6 +376,8 @@ impl ReceiveGroup {
 
                         clamp_value(&s.$name, &mut $iter(r));
 
+                        drop(ranges);
+
                         if s.automatic_update.is_checked() {
                             s.values_changed();
                         }
@@ -477,6 +478,8 @@ impl ReceiveGroup {
                                 Samplerate::Values(_) => unreachable!(),
                             }
 
+                            drop(ranges);
+
                             if s.automatic_update.is_checked() {
                                 s.values_changed();
                             }
@@ -523,7 +526,7 @@ impl ReceiveGroup {
                 scale_to_mega(&mut ranges.frequency);
                 scale_to_mega(&mut ranges.bandwidth);
 
-                *self.value_ranges.borrow_mut() = Some(ranges);
+                self.value_ranges.replace(Some(ranges));
             }
             _ => (),
         }
@@ -992,6 +995,8 @@ impl<T: FftNum> Debug for FftData<T> {
 }
 
 fn main() {
+    env_logger::builder().format_timestamp(None).init();
+
     QApplication::init(|_| unsafe {
         let app = App::new();
         let timer = QTimer::new_0a();
@@ -1002,13 +1007,13 @@ fn main() {
 
             match event {
                 Ok(Some(GuiBoundEvent::Error(e))) => {
-                    eprintln!("Device encountered an error: {}", e);
+                    log::error!("Device encountered an error: {}", e);
                 }
                 Ok(mut event) => {
                     app.handle_event(&mut event);
                 }
                 Err(_) => {
-                    eprintln!("The receiver worker thread has panicked, resetting worker");
+                    log::error!("The receiver worker thread has panicked, resetting worker");
 
                     app.reset_worker();
                 }

@@ -286,6 +286,8 @@ impl DeviceWorker {
                         assert!(self.available_devices.is_some());
 
                         let args = clone_args(&self.available_devices.as_ref().unwrap()[index]);
+
+                        log::info!("Creating device ({})", args);
                         let dev = Device::new(args)?;
 
                         let num_channels = dev.num_channels(Rx)?;
@@ -325,6 +327,8 @@ impl DeviceWorker {
                             .map(|d| d.get("label").unwrap().to_owned())
                             .collect();
 
+                        log::info!("Available devices: {:?}", names);
+
                         self.available_devices = Some(available);
 
                         self.sender
@@ -335,15 +339,16 @@ impl DeviceWorker {
 
                         // compares the new state to the one currently set and if they differ (or the previous state is unset, this is why it's so ugly) run the block
                         macro_rules! if_differs {
-                        ($($var:ident, $then:expr);+ $(;)?) => {
-                            $(
-                                if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
-                                    $then;
-                                    dbg!($var);
-                                }
-                            );+
+                            ($($var:ident, $then:expr);+ $(;)?) => {
+                                $(
+                                    if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
+                                        $then;
+                                    }
+                                );+
+                            }
                         }
-                    }
+
+                        log::trace!("Configuring receiver:\n{:#?}", state);
 
                         let ReceiverState {
                             channel,
@@ -357,7 +362,8 @@ impl DeviceWorker {
 
                         let dev = self.device.as_ref().unwrap();
 
-                        let mut antennas = dbg!(dev.antennas(Rx, channel)?);
+                        let mut antennas = dev.antennas(Rx, channel)?;
+
                         dev.set_antenna(
                             Rx,
                             channel,
@@ -379,6 +385,8 @@ impl DeviceWorker {
                                 self.receive_stream = Some(new_receiver);
                             };
                         );
+
+                        self.receive_state = Some(state);
                     }
                     DeviceBoundCommand::RequestData { mut data } => {
                         assert!(self.receive_stream.is_some());
@@ -395,11 +403,8 @@ impl DeviceWorker {
             }
 
             if let Some(stream) = self.receive_stream.as_mut() {
-                let read_count =
+                let _read_count =
                     stream.read(&mut [self.working_memory.as_mut()], RECEIVE_TIMEOUT_US)?;
-                if read_count != RECEIVE_SIZE {
-                    eprintln!("Reading timed out");
-                }
             }
         }
     }

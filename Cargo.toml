@@ -10,7 +10,9 @@ qt_charts = "0.5.0"
 rustfft = {version = "6.0.1", default-features = false}
 # The std concurrent channel is broken https://github.com/rust-lang/rust/issues/39364 
 crossbeam-channel = "0.5.1"
+log = "0.4.14"
+env_logger = "0.9.0"
 
-# Fix for breaking non-semver changes in dependencies which haven't been bumped because the lib (qt ritual) is seemingly dead
+# Fix for breaking non-semver changes in qt ritual dependencies which haven't been bumped because the lib is seemingly dead
 syn = "=1.0.57"
 serde = "=1.0.118"  
