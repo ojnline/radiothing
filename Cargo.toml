@@ -12,6 +12,7 @@ rustfft = {version = "6.0.1", default-features = false}
 crossbeam-channel = "0.5.1"
 log = "0.4.14"
 env_logger = "0.9.0"
+pico-args = {version = "0.4.2", default-features = false, features = ["combined-flags"]}
 
 # Fix for breaking non-semver changes in qt ritual dependencies which haven't been bumped because the lib is seemingly dead
 syn = "=1.0.57"

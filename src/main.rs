@@ -1,11 +1,11 @@
-mod device;
-mod settings;
+pub mod device;
+pub mod settings;
 
 use device::{DeviceBoundCommand, DeviceError, DeviceManager, GuiBoundEvent, ValueRanges};
 use qt_charts::{
     cpp_core::CppBox,
     qt_core::{AlignmentFlag, CheckState, QRectF, QTimer, SlotOfBool, SlotOfInt},
-    qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QImage, QPixmap},
+    qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QGuiApplication, QImage, QPixmap},
     *,
 };
 use qt_widgets::{
@@ -21,13 +21,18 @@ use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftNum, FftPlanner};
 use std::{
     borrow::Borrow,
     cell::{Cell, RefCell},
+    error::Error,
     fmt::{Debug, Formatter},
     ops::Range,
+    path::PathBuf,
     rc::Rc,
     sync::Arc,
 };
 
-use crate::device::{ReceiverState, RxFormat};
+use crate::{
+    device::{ReceiverState, RxFormat},
+    settings::Field,
+};
 
 // crash on BadState, ignore WorkerPoisoned because it will be handled in the next iteration
 // previously the code ws just unwrapping the result which enabled a race condition when the worker thread has just closed
@@ -48,17 +53,21 @@ struct DeviceGroup {
     group: QBox<QGroupBox>,
     combo_box: QBox<QComboBox>,
     auto_select: QBox<QCheckBox>,
-    entry: QBox<QLineEdit>,
+    filter: QBox<QLineEdit>,
     row_widget: QBox<QWidget>,
     b1: QBox<QPushButton>,
     b2: QBox<QPushButton>,
     b3: QBox<QPushButton>,
 
     device: Rc<DeviceManager>,
+    settings: Rc<AppSettings>,
 }
 
 impl DeviceGroup {
-    unsafe fn new(device: Rc<DeviceManager>) -> (Rc<DeviceGroup>, Ptr<QGroupBox>) {
+    unsafe fn new(
+        device: Rc<DeviceManager>,
+        settings: Rc<AppSettings>,
+    ) -> (Rc<DeviceGroup>, Ptr<QGroupBox>) {
         let layout = QVBoxLayout::new_0a();
         let group = QGroupBox::new();
         group.set_title(&qs("Device"));
@@ -66,10 +75,12 @@ impl DeviceGroup {
 
         let auto_select = QCheckBox::new();
         auto_select.set_text(&qs("Auto select device"));
+        auto_select.set_checked(settings.auto_select_device);
         layout.add_widget(&auto_select);
 
         let entry = QLineEdit::new();
         entry.set_placeholder_text(&qs("Device filter"));
+        entry.set_text(&qs(&settings.device_filter));
 
         let combo_box = QComboBox::new_0a();
 
@@ -96,19 +107,20 @@ impl DeviceGroup {
 
         // send a refresh request once beforehand
         handle_send_result(device.send_command(DeviceBoundCommand::RefreshDevices {
-            args: String::new(),
+            args: settings.device_filter.clone(),
         }));
 
         let s = Rc::new(Self {
             group,
             combo_box,
-            entry,
+            filter: entry,
             row_widget,
             b1,
             b2,
             b3,
             auto_select,
-            // radio: RefCell::new(Radio::new()),
+
+            settings,
             device,
         });
 
@@ -132,7 +144,7 @@ impl DeviceGroup {
         auto_select
             .clicked()
             .connect(&SlotOfBool::new(group, move |checked| {
-                s.entry.set_enabled(!checked);
+                s.filter.set_enabled(!checked);
                 s.combo_box.set_enabled(!checked);
             }));
 
@@ -148,7 +160,7 @@ impl DeviceGroup {
         b1.clicked().connect(&SlotNoArgs::new(group, move || {
             // only send refresh request when the last one has finished
             if !s.device.get_refreshing_devices() {
-                let filter = s.entry.text().to_std_string();
+                let filter = s.filter.text().to_std_string();
 
                 handle_send_result(
                     s.device
@@ -196,9 +208,52 @@ impl DeviceGroup {
                 for name in list {
                     self.combo_box.add_item_q_string(&qs(name.as_str()));
                 }
+
+                if self.auto_select.is_enabled() {
+                    // if there were no devices found, search again
+                    // FIXME would be better to do this less frequently
+                    if list.is_empty() {
+                        self.b1.click();
+                        return;
+                    }
+
+                    // try to find the exact device as was selected previously
+                    if !self.settings.device.is_empty() {
+                        if let Some((i, _)) = list
+                            .iter()
+                            .enumerate()
+                            .find(|(_, s)| **s == self.settings.device)
+                        {
+                            self.combo_box.set_current_index(i as i32);
+                            self.b2.click();
+                            return;
+                        }
+                    }
+
+                    // just select the first device
+                    self.combo_box.set_current_index(0);
+                    self.b2.click();
+                }
             }
             _ => (),
         };
+    }
+    unsafe fn populate_settings(&self, settings: &mut AppSettings) {
+        let AppSettings {
+            auto_select_device,
+            device_filter,
+            device,
+            ..
+        } = settings;
+
+        *auto_select_device = self.auto_select.is_checked();
+
+        *device_filter = self.filter.text().to_std_string();
+
+        *device = match self.combo_box.count() {
+            0 => "".to_string(),
+            _ => self.combo_box.current_text().to_std_string(),
+        }
     }
 }
 
@@ -231,13 +286,17 @@ struct ReceiveGroup {
 }
 
 impl ReceiveGroup {
-    unsafe fn new(device: Rc<DeviceManager>) -> (Rc<Self>, Ptr<QGroupBox>) {
+    unsafe fn new(
+        device: Rc<DeviceManager>,
+        settings: Rc<AppSettings>,
+    ) -> (Rc<Self>, Ptr<QGroupBox>) {
         let group = QGroupBox::new();
         group.set_title(&qs("Receive"));
 
         let v = QVBoxLayout::new_0a();
 
         let automatic_update = QCheckBox::new();
+        automatic_update.set_checked(settings.auto_update);
         automatic_update.set_text(&qs("Automatic update"));
         v.add_widget(&automatic_update);
 
@@ -247,20 +306,25 @@ impl ReceiveGroup {
 
         let frequency = QDoubleSpinBox::new_0a();
         frequency.set_suffix(&qs(" MHz"));
+        frequency.set_value(settings.frequency);
         form_layout.add_row_q_string_q_widget(&qs("Frequency"), &frequency);
 
         let samplerate = QDoubleSpinBox::new_0a();
         samplerate.set_suffix(&qs(" MSps"));
+        samplerate.set_value(settings.samplerate);
         form_layout.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
 
         let gain = QDoubleSpinBox::new_0a();
         gain.set_suffix(&qs(" dB"));
+        gain.set_value(settings.gain);
         form_layout.add_row_q_string_q_widget(&qs("Gain"), &gain);
 
         let automatic_gain = QCheckBox::new();
+        automatic_gain.set_checked(settings.automatic_gain);
         form_layout.add_row_q_string_q_widget(&qs("Automatic gain"), &automatic_gain);
 
         let automatic_dc_offset = QCheckBox::new();
+        automatic_dc_offset.set_checked(settings.automatic_dc_offset);
         form_layout.add_row_q_string_q_widget(&qs("Automatic DC offset"), &automatic_dc_offset);
 
         let apply_btn = QPushButton::new();
@@ -406,7 +470,6 @@ impl ReceiveGroup {
                 s.values_changed();
             }));
     }
-
     unsafe fn handle_event(self: &Rc<Self>, event: &mut Option<GuiBoundEvent>) {
         {
             let enabled = self.device.get_device_valid();
@@ -530,6 +593,35 @@ impl ReceiveGroup {
             }
             _ => (),
         }
+    }
+    unsafe fn populate_settings(&self, settings: &mut AppSettings) {
+        let AppSettings {
+            auto_update,
+            frequency,
+            samplerate,
+            gain,
+            automatic_gain,
+            automatic_dc_offset,
+            ..
+        } = settings;
+
+        // TODO deduplicate this from values_changed()
+        *auto_update = self.automatic_update.is_checked();
+
+        *frequency = self.frequency.value();
+        *samplerate = match &*self.samplerate.borrow() {
+            Samplerate::Ranges(spinbox) => spinbox.value(),
+            // in the case of only discreet values being available, minimum==maximum
+            // simply get it from the Range minimum
+            Samplerate::Values(combox) => {
+                self.value_ranges.borrow().as_ref().unwrap().samplerate
+                    [combox.current_index() as usize]
+                    .minimum
+            }
+        };
+        *gain = self.gain.value();
+        *automatic_gain = self.automatic_gain.is_checked();
+        *automatic_dc_offset = self.automatic_dc_offset.is_checked();
     }
 }
 
@@ -763,7 +855,10 @@ struct OutputGroup {
 }
 
 impl OutputGroup {
-    unsafe fn new(device: Rc<DeviceManager>) -> (Rc<Self>, Ptr<QGroupBox>) {
+    unsafe fn new(
+        device: Rc<DeviceManager>,
+        settings: Rc<AppSettings>,
+    ) -> (Rc<Self>, Ptr<QGroupBox>) {
         let group = QGroupBox::new();
         let grid = QGridLayout::new_0a();
 
@@ -861,6 +956,212 @@ impl OutputGroup {
     }
 }
 
+#[derive(Clone, Debug)]
+struct AppSettings {
+    auto_select_device: bool,
+    device_filter: String,
+    device: String,
+
+    auto_update: bool,
+    frequency: f64,
+    samplerate: f64,
+    gain: f64,
+    automatic_gain: bool,
+    automatic_dc_offset: bool,
+}
+
+impl AppSettings {
+    fn pretty_serialize(&self) -> String {
+        let AppSettings {
+            auto_select_device,
+            device_filter,
+            device,
+            auto_update,
+            frequency,
+            samplerate,
+            gain,
+            automatic_gain,
+            automatic_dc_offset,
+            ..
+        } = self.clone();
+
+        format!(
+r#"auto_device = {:8}      # if true, the application tries to immediatelly select a device without user input
+device_filter = {:8}    # the "args" used to filter the SoapySDR devices, for example 'driver=RTLSDR' or 'hardware=R820T' 
+device = {:8}           # the 'label' field of the device used last time, auto_select_device first tries to find a device with this label
+
+auto_update = {:8}      # whether to update the receiver configuration immediatelly after a value is changed
+
+    # values of the different configuration options
+    frequency = {} # MHz
+    samplerate = {} # MSps
+    gain = {} # dB
+    automatic_gain = "{}"
+    automatic_dc_offset = "{}""#,
+            
+            // here we need to format the Field rather than the std types for the format minimum width to be correct
+            format!("\"{}\"", auto_select_device),
+            format!("\"{}\"", device_filter),
+            format!("\"{}\"", device),
+            format!("\"{}\"", auto_update),
+            frequency,
+            samplerate,
+            gain,
+            automatic_gain,
+            automatic_dc_offset,
+        )
+    }
+}
+
+const DEFAULT_SETTINGS: AppSettings = AppSettings {
+    auto_select_device: false,
+    device_filter: String::new(),
+    device: String::new(),
+
+    auto_update: false,
+    frequency: 0.0,
+    samplerate: 0.0,
+    gain: 0.0,
+    automatic_gain: false,
+    automatic_dc_offset: false,
+};
+
+//                      (Settings, Save path)
+fn get_settings() -> (AppSettings, Option<PathBuf>) {
+    const HELP: &str = "\
+    Overview: Tool for receiving transmission from weather baloons.
+    
+    Usage: radiothing [options]
+    
+    Options:
+    --create-config       Write default config file to provided path and immediatelly exit, CWD if empty.
+    -c, --config          Path to configuration file and/or the path the config will be saved to,
+                          by default the current working directory.
+    -i, --ignore-config   Ignore any configuration file, don't save upon exit either.
+    -s, --save-config     Path to save the configuration on program exit, by default same as path.
+    -h, --help            Print this help.
+    ";
+
+    let mut args = pico_args::Arguments::from_env();
+
+    if args.contains(["-h", "--help"]) {
+        print!("{}", HELP);
+        std::process::exit(0);
+    }
+
+    if args.contains("--create-config") {
+        let path = args
+            .opt_value_from_str("--create-config")
+            .unwrap()
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap()
+                    .join("radiothing_config.txt")
+            });
+
+        log::info!("Creating default configuration at '{}'", path.to_string_lossy());
+
+        match std::fs::write(&path, DEFAULT_SETTINGS.pretty_serialize()) {
+            Err(e) => log::error!(
+                "Error writing config to file at '{}': {}",
+                path.to_string_lossy(),
+                e
+            ),
+            Ok(_) => {}
+        }
+
+        std::process::exit(0);
+    }
+
+    if !args.contains(["-i", "--ignore-config"]) {
+        let path = args
+            .opt_value_from_str(["-c", "--config"])
+            .unwrap()
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap()
+                    .join("radiothing_config.txt")
+            });
+
+        let save_path = if let Some(save) = args.opt_value_from_str(["s", "--save-config"]).unwrap() {
+            Some(save)
+        } else if args.contains(["-s", "--save-config"]) {
+            Some(path.clone())
+        } else {
+            None
+        };
+
+        log::info!(
+            "Reading configuration file at '{}'",
+            path.to_string_lossy()
+        );
+
+        match &save_path {
+            Some(path) => log::info!("Save path is '{}'", path.to_string_lossy()),
+            None => log::info!("Will not save config"),
+        }
+
+        if path.is_file() {
+            let string = match std::fs::read_to_string(&path) {
+                Ok(string) => string,
+                Err(e) => {
+                    log::error!(
+                        "Error reading config file at '{}': {}",
+                        path.to_string_lossy(),
+                        e
+                    );
+                    return (DEFAULT_SETTINGS, save_path);
+                }
+            };
+            
+            let (settings, errors) = settings::Settings::new(string.as_str());
+
+            if !errors.is_empty() {
+                let errors_string: String = errors.iter().map(|e| e.to_string() + "\n").collect();
+                log::error!(
+                    "Encountered errors while parsing settings, falling back to defaults:\n{}",
+                    errors_string
+                );
+
+                // the parsed settings can't be assumed to be correct
+                // fall back to the defaults but set save_config to false so that
+                // we don't overwrite the bad settings file in case the error there is only minor
+                return (DEFAULT_SETTINGS, None);
+            } else {
+                macro_rules! settings_from_settings {
+                        ($($field:ident),* $(,)*) => {
+                            AppSettings {
+                                $(
+                                    $field: settings.get(stringify!($field)).unwrap_or(DEFAULT_SETTINGS.$field),
+                                )*
+                            }
+                        }
+                    }
+
+                let settings = settings_from_settings! {
+                    auto_select_device,
+                    device,
+                    device_filter,
+                    auto_update,
+                    frequency,
+                    samplerate,
+                    gain,
+                    automatic_gain,
+                    automatic_dc_offset,
+                };
+
+                return (settings, save_path);
+            }
+        } else {
+            log::error!("Config file at '{}' is not a file", path.to_string_lossy())
+        }
+    } else {
+        log::info!("Ignoring config");
+    }
+
+    return (DEFAULT_SETTINGS, None);
+}
+
 #[allow(unused)]
 struct App {
     root: QBox<QWidget>,
@@ -870,10 +1171,15 @@ struct App {
     output_group: Rc<OutputGroup>,
 
     device: Rc<DeviceManager>,
+    settings: Rc<AppSettings>,
+    save_path: Option<PathBuf>
 }
 
 impl App {
     unsafe fn new() -> Self {
+        let (settings, save_path) = get_settings();
+        let settings = Rc::new(settings);
+
         let device = Rc::new(DeviceManager::new());
 
         let root = QWidget::new_0a();
@@ -883,14 +1189,14 @@ impl App {
 
         h_layout.add_layout_1a(&v_layout);
 
-        let (device_group, group) = DeviceGroup::new(device.clone());
+        let (device_group, group) = DeviceGroup::new(device.clone(), settings.clone());
         v_layout.add_widget(group);
 
-        let (receive_group, group) = ReceiveGroup::new(device.clone());
+        let (receive_group, group) = ReceiveGroup::new(device.clone(), settings.clone());
         v_layout.add_widget(group);
         v_layout.add_stretch_0a();
 
-        let (output_group, group) = OutputGroup::new(device.clone());
+        let (output_group, group) = OutputGroup::new(device.clone(), settings.clone());
         h_layout.add_widget(group);
 
         h_layout.add_stretch_0a();
@@ -902,9 +1208,11 @@ impl App {
             device_group,
             receive_group,
             output_group,
-
             v_layout,
+
             device,
+            settings,
+            save_path
         }
     }
     unsafe fn handle_event(&self, mut event: &mut Option<GuiBoundEvent>) {
@@ -925,6 +1233,13 @@ impl App {
 
         let mut event = Some(GuiBoundEvent::WorkerReset);
         self.handle_event(&mut event);
+    }
+    unsafe fn collect_settings(&self) -> AppSettings {
+        let mut settings = DEFAULT_SETTINGS;
+        self.device_group.populate_settings(&mut settings);
+        self.receive_group.populate_settings(&mut settings);
+
+        settings
     }
 }
 
@@ -997,28 +1312,39 @@ impl<T: FftNum> Debug for FftData<T> {
 fn main() {
     env_logger::builder().format_timestamp(None).init();
 
-    QApplication::init(|_| unsafe {
-        let app = App::new();
+    QApplication::init(|qapp| unsafe {
+        let app = Rc::new(App::new());
         let timer = QTimer::new_0a();
         timer.set_interval(100);
 
+        let a = app.clone();
         timer.timeout().connect(&SlotNoArgs::new(&timer, move || {
-            let event = app.device.try_receive();
+            let event = a.device.try_receive();
 
             match event {
                 Ok(Some(GuiBoundEvent::Error(e))) => {
                     log::error!("Device encountered an error: {}", e);
                 }
                 Ok(mut event) => {
-                    app.handle_event(&mut event);
+                    a.handle_event(&mut event);
                 }
                 Err(_) => {
                     log::error!("The receiver worker thread has panicked, resetting worker");
 
-                    app.reset_worker();
+                    a.reset_worker();
                 }
             }
         }));
+
+        qapp.last_window_closed()
+            .connect(&SlotNoArgs::new(qapp, move || {
+                if let Some(path) = &app.save_path {
+                    let settings = app.collect_settings();
+                    let string = settings.pretty_serialize();
+
+                    std::fs::write(path, string).unwrap();
+                }
+            }));
 
         timer.start_0a();
         QApplication::exec()

@@ -1,4 +1,10 @@
-use std::{collections::HashMap, error::Error, fmt::Display, path::Path};
+use std::{
+    collections::HashMap,
+    convert::{TryFrom, TryInto},
+    error::Error,
+    fmt::Display,
+    path::Path,
+};
 
 #[derive(Clone, Debug)]
 pub enum Field {
@@ -6,6 +12,73 @@ pub enum Field {
     Number(f64),
     ParseError,
 }
+
+impl Display for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Field::String(s) => write!(f, "\"{}\"", s),
+            Field::Number(n) => write!(f, "{}", n),
+            Field::ParseError => write!(f, "Parse Error"),
+        }
+    }
+}
+
+macro_rules! field_try_into {
+    ($type:ty, $string:stmt, $number:stmt) => {
+        impl TryFrom<Field> for $type {
+            type Error = ();
+
+            fn try_from(field: Field) -> Result<$type, Self::Error> {
+                match field {
+                    Field::String(s) => return { $string }(s),
+                    Field::Number(n) => return { $number }(n),
+                    Field::ParseError => Err(()),
+                }
+            }
+        }
+    };
+}
+
+// mwuah
+field_try_into! {f64, |s: String| s.parse::<f64>().map_err(|_| ()), |n| Ok(n)}
+field_try_into! {f32, |s: String| s.parse::<f32>().map_err(|_| ()), |n| Ok(n as f32)}
+field_try_into! {u64, |s: String| s.parse::<u64>().map_err(|_| ()), |n| Ok(n as u64)}
+field_try_into! {u32, |s: String| s.parse::<u32>().map_err(|_| ()), |n| Ok(n as u32)}
+field_try_into! {String, |s| Ok(s), |n: f64| Ok(n.to_string())}
+field_try_into! {bool,
+    |s: String| match s.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(())},
+    |n: f64| {
+        if n == 1.0 { Ok(true) }
+        else
+        if n == 0.0 { Ok(false)}
+        else        { Err(())}
+    }
+}
+
+macro_rules! field_from {
+    ($type:ty, $from:stmt) => {
+        impl From<$type> for Field {
+            fn from(val: $type) -> Self {
+                return { $from }(val);
+            }
+        }
+    };
+}
+
+field_from! {f64, |v| Field::Number(v)}
+field_from! {f32, |v| Field::Number(v as f64)}
+field_from! {u64, |v| Field::Number(v as f64)}
+field_from! {u32, |v| Field::Number(v as f64)}
+field_from! {String, |v| Field::String(v)}
+field_from! {bool, |v| Field::String(
+    match v {
+        true => "true".to_string(),
+        false => "false".to_string(),
+    }
+)}
 
 struct CharCursor<'a> {
     inner: std::str::CharIndices<'a>,
@@ -367,6 +440,19 @@ impl Settings {
     }
     pub fn into_hashmap(self) -> HashMap<String, Field> {
         self.fields
+    }
+    pub fn get_field(&self, name: &str) -> Option<&Field> {
+        self.fields.get(name)
+    }
+    pub fn get<T: TryFrom<Field>>(&self, name: &str) -> Option<T> {
+        self.fields
+            .get(name)
+            .and_then(|f| TryFrom::try_from(f.clone()).ok())
+    }
+    pub fn set<T: Into<Field>>(&mut self, name: &str, t: T) {
+        // to clone the name only if there is no previous entry we would need the unstable hash_raw_entry
+        // https://github.com/rust-lang/rust/issues/56167
+        self.fields.insert(name.to_string(), t.into());
     }
 }
 
