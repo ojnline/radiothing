@@ -1310,7 +1310,11 @@ impl<T: FftNum> Debug for FftData<T> {
 }
 
 fn main() {
-    env_logger::builder().format_timestamp(None).init();
+    use std::io::Write;
+
+    env_logger::builder().format(|buf, record| 
+        writeln!(buf, "[{:5}] {}", record.level(), record.args())
+    ).init();
 
     QApplication::init(|qapp| unsafe {
         let app = Rc::new(App::new());
