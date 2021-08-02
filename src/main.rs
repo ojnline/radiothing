@@ -986,7 +986,7 @@ impl AppSettings {
         } = self.clone();
 
         format!(
-r#"auto_device = {:8}      # if true, the application tries to immediatelly select a device without user input
+            r#"auto_device = {:8}      # if true, the application tries to immediatelly select a device without user input
 device_filter = {:8}    # the "args" used to filter the SoapySDR devices, for example 'driver=RTLSDR' or 'hardware=R820T' 
 device = {:8}           # the 'label' field of the device used last time, auto_select_device first tries to find a device with this label
 
@@ -998,8 +998,8 @@ auto_update = {:8}      # whether to update the receiver configuration immediate
     gain = {} # dB
     automatic_gain = "{}"
     automatic_dc_offset = "{}""#,
-            
-            // here we need to format the Field rather than the std types for the format minimum width to be correct
+            // the data is first formatted into a string before being interpolated into the main string
+            // so that the minimum width-format is correct
             format!("\"{}\"", auto_select_device),
             format!("\"{}\"", device_filter),
             format!("\"{}\"", device),
@@ -1029,18 +1029,18 @@ const DEFAULT_SETTINGS: AppSettings = AppSettings {
 //                      (Settings, Save path)
 fn get_settings() -> (AppSettings, Option<PathBuf>) {
     const HELP: &str = "\
-    Overview: Tool for receiving transmission from weather baloons.
-    
-    Usage: radiothing [options]
-    
-    Options:
-    --create-config       Write default config file to provided path and immediatelly exit, CWD if empty.
-    -c, --config          Path to configuration file and/or the path the config will be saved to,
-                          by default the current working directory.
-    -i, --ignore-config   Ignore any configuration file, don't save upon exit either.
-    -s, --save-config     Path to save the configuration on program exit, by default same as path.
-    -h, --help            Print this help.
-    ";
+Overview: Tool for receiving transmission from weather baloons.
+
+Usage: radiothing [options]
+
+Options:
+--create-config       Write default config file to provided path and immediatelly exit, CWD if empty.
+-c, --config          Path to configuration file and/or the path the config will be saved to,
+                      by default the current working directory.
+-i, --ignore-config   Ignore any configuration file, don't save upon exit either.
+-s, --save-config     Path to save the configuration on program exit, by default same as path.
+-h, --help            Print this help.
+";
 
     let mut args = pico_args::Arguments::from_env();
 
@@ -1059,7 +1059,10 @@ fn get_settings() -> (AppSettings, Option<PathBuf>) {
                     .join("radiothing_config.txt")
             });
 
-        log::info!("Creating default configuration at '{}'", path.to_string_lossy());
+        log::info!(
+            "Creating default configuration at '{}'",
+            path.to_string_lossy()
+        );
 
         match std::fs::write(&path, DEFAULT_SETTINGS.pretty_serialize()) {
             Err(e) => log::error!(
@@ -1083,18 +1086,16 @@ fn get_settings() -> (AppSettings, Option<PathBuf>) {
                     .join("radiothing_config.txt")
             });
 
-        let save_path = if let Some(save) = args.opt_value_from_str(["-s", "--save-config"]).unwrap() {
-            Some(save)
-        } else if args.contains(["-s", "--save-config"]) {
-            Some(path.clone())
-        } else {
-            None
-        };
+        let save_path =
+            if let Some(save) = args.opt_value_from_str(["-s", "--save-config"]).unwrap() {
+                Some(save)
+            } else if args.contains(["-s", "--save-config"]) {
+                Some(path.clone())
+            } else {
+                None
+            };
 
-        log::info!(
-            "Reading configuration file at '{}'",
-            path.to_string_lossy()
-        );
+        log::info!("Reading configuration file at '{}'", path.to_string_lossy());
 
         match &save_path {
             Some(path) => log::info!("Save path is '{}'", path.to_string_lossy()),
@@ -1113,7 +1114,7 @@ fn get_settings() -> (AppSettings, Option<PathBuf>) {
                     return (DEFAULT_SETTINGS, save_path);
                 }
             };
-            
+
             let (settings, errors) = settings::Settings::new(string.as_str());
 
             if !errors.is_empty() {
@@ -1172,7 +1173,7 @@ struct App {
 
     device: Rc<DeviceManager>,
     settings: Rc<AppSettings>,
-    save_path: Option<PathBuf>
+    save_path: Option<PathBuf>,
 }
 
 impl App {
@@ -1212,7 +1213,7 @@ impl App {
 
             device,
             settings,
-            save_path
+            save_path,
         }
     }
     unsafe fn handle_event(&self, mut event: &mut Option<GuiBoundEvent>) {
@@ -1312,9 +1313,9 @@ impl<T: FftNum> Debug for FftData<T> {
 fn main() {
     use std::io::Write;
 
-    env_logger::builder().format(|buf, record| 
-        writeln!(buf, "[{:5}] {}", record.level(), record.args())
-    ).init();
+    env_logger::builder()
+        .format(|buf, record| writeln!(buf, "[{:5}] {}", record.level(), record.args()))
+        .init();
 
     // FIXME
     // this is a bodge to fix qt from complaining about "QBasicTimer::start: QBasicTimer can only be used with threads started with QThread"
