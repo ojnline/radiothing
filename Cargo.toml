@@ -16,4 +16,4 @@ pico-args = {version = "0.4.2", default-features = false, features = ["combined-
 
 # Fix for breaking non-semver changes in qt ritual dependencies which haven't been bumped because the lib is seemingly dead
 syn = "=1.0.57"
-serde = "=1.0.118"  
+serde = "=1.0.118"
