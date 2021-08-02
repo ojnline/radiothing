@@ -1083,7 +1083,7 @@ fn get_settings() -> (AppSettings, Option<PathBuf>) {
                     .join("radiothing_config.txt")
             });
 
-        let save_path = if let Some(save) = args.opt_value_from_str(["s", "--save-config"]).unwrap() {
+        let save_path = if let Some(save) = args.opt_value_from_str(["-s", "--save-config"]).unwrap() {
             Some(save)
         } else if args.contains(["-s", "--save-config"]) {
             Some(path.clone())
@@ -1316,8 +1316,16 @@ fn main() {
         writeln!(buf, "[{:5}] {}", record.level(), record.args())
     ).init();
 
+    // FIXME
+    // this is a bodge to fix qt from complaining about "QBasicTimer::start: QBasicTimer can only be used with threads started with QThread"
+    // on application exit, apparently it often implies weird widget destruction order but leaving a reference here outside of QApplication::init
+    // fixes it somehow?
+    let mut keep_alive_outside_event_event_loop = None;
+
     QApplication::init(|qapp| unsafe {
         let app = Rc::new(App::new());
+        keep_alive_outside_event_event_loop = Some(app.clone());
+
         let timer = QTimer::new_0a();
         timer.set_interval(100);
 
@@ -1340,7 +1348,7 @@ fn main() {
             }
         }));
 
-        qapp.last_window_closed()
+        qapp.about_to_quit()
             .connect(&SlotNoArgs::new(qapp, move || {
                 if let Some(path) = &app.save_path {
                     let settings = app.collect_settings();
@@ -1351,6 +1359,7 @@ fn main() {
             }));
 
         timer.start_0a();
+
         QApplication::exec()
     })
 }
