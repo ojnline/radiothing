@@ -325,9 +325,13 @@ impl DeviceWorker {
                         let names = available
                             .iter()
                             .map(|d| d.get("label").unwrap().to_owned())
-                            .collect();
+                            .collect::<Vec<_>>();
 
-                        log::info!("Available devices: {:?}", names);
+                        // the refresh request is possibly sent very frequently if auto_select is true
+                        // avoid spamming empty messages if there is nothing to report
+                        if !names.is_empty() {
+                            log::info!("Available devices: {:#?}", names);
+                        }
 
                         self.available_devices = Some(available);
 

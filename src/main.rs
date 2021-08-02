@@ -1,3 +1,4 @@
+mod decode;
 pub mod device;
 pub mod settings;
 
@@ -146,6 +147,9 @@ impl DeviceGroup {
             .connect(&SlotOfBool::new(group, move |checked| {
                 s.filter.set_enabled(!checked);
                 s.combo_box.set_enabled(!checked);
+                // start the refreshing pingpong
+                // FIXME clicking the refresh button from code is a very poorly searchable pattern
+                s.b1.click();
             }));
 
         let s = self.clone();
@@ -189,8 +193,6 @@ impl DeviceGroup {
 
             s.b3.set_enabled(false);
         }));
-
-        // b1.click();
     }
     unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
         match event.as_ref().unwrap() {
@@ -209,7 +211,7 @@ impl DeviceGroup {
                     self.combo_box.add_item_q_string(&qs(name.as_str()));
                 }
 
-                if self.auto_select.is_enabled() {
+                if self.auto_select.is_checked() {
                     // if there were no devices found, search again
                     // FIXME would be better to do this less frequently
                     if list.is_empty() {
