@@ -1314,7 +1314,17 @@ fn main() {
     use std::io::Write;
 
     env_logger::builder()
-        .format(|buf, record| writeln!(buf, "[{:5}] {}", record.level(), record.args()))
+        .format(|buf, record| {
+            // needed for minimum width format to work correctly without allocation
+            let level = match record.level() {
+                log::Level::Error => "[ERROR]",
+                log::Level::Warn => "[WARN]",
+                log::Level::Info => "[INFO]",
+                log::Level::Debug => "[DEBUG]",
+                log::Level::Trace => "[TRACE]",
+            };
+            writeln!(buf, "{:5} {}", level, record.args())
+        })
         .init();
 
     // FIXME
