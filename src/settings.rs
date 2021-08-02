@@ -382,7 +382,7 @@ impl Settings {
                                         }
                                     }
                                 }
-                                '\n' | '#' | '\0' => break 'number,
+                                '\n' | '#' | '\0' | _ if cursor.current().1.is_whitespace() => break 'number,
                                 other => {
                                     if !other.is_ascii_digit() {
                                         err!("Expected an ascii digit or '.' while parsing a number, found '{}'.", other);
@@ -468,7 +468,7 @@ fn correct() {
     c = 32.0
     0Bbia3 = "test"
     far     =       42
-                offset =             0
+                offset =             0      # comment
     squished="" #comment on same line
     escaped="\n\r\t\0\'\""
     úňíčöďë = "yes"
