@@ -83,7 +83,6 @@ field_from! {bool, |v| Field::String(
 struct CharCursor<'a> {
     inner: std::str::CharIndices<'a>,
     cur: (usize, char),
-    peek: (usize, char),
 
     cur_line: usize,
     cur_column: usize,
@@ -91,41 +90,37 @@ struct CharCursor<'a> {
 
 impl<'a> CharCursor<'a> {
     fn new(string: &'a str) -> Self {
-        let mut s = Self {
-            inner: string.char_indices(),
-            cur: (0, '\0'),
-            peek: (0, '\0'),
+        let mut inner = string.char_indices();
+
+        Self {
+            cur: inner.next().unwrap_or((0, '\0')),
+            inner,
             cur_line: 0,
             cur_column: 0,
-        };
-        // pump the iterator two times so that the current char is the first char in the string
-        s.next();
-        s.next();
-        s
+        }
     }
     fn next(&mut self) -> (usize, char) {
-        if self.cur.1 == '\n' {
-            self.cur_line += 1;
-            self.cur_column = 0;
-        } else {
-            self.cur_column += 1;
+        match self.cur.1 {
+            '\n' => {
+                self.cur_line += 1;
+                self.cur_column = 0;
+            }
+            // null means end of buffer / end of the iterator
+            // return early with the last value
+            '\0' => return self.cur,
+            _ => self.cur_column += 1,
         }
 
-        self.cur = self.peek;
-
         if let Some(next) = self.inner.next() {
-            self.peek = next;
+            self.cur = next;
         } else {
-            self.peek.1 = '\0'
+            self.cur.1 = '\0'
         }
 
         self.cur
     }
     fn current(&self) -> (usize, char) {
         self.cur
-    }
-    fn peek(&self) -> (usize, char) {
-        self.peek
     }
     fn line(&self) -> usize {
         self.cur_line
@@ -360,13 +355,15 @@ impl Settings {
 
                         let mut number = 0.0;
                         'number: loop {
-                            match cursor.current().1 {
+                            let current = cursor.current().1;
+                            match current {
                                 '.' => {
                                     let mut decimal_number = 0.0;
                                     let mut multiplier = 0.1;
                                     loop {
-                                        match cursor.next().1 {
-                                            '\n' | '\0' => {
+                                        let next = cursor.next().1;
+                                        match next {
+                                            '\n' | '#' | '\0' | _ if next.is_whitespace() => {
                                                 number += decimal_number;
                                                 break 'number;
                                             },
@@ -382,7 +379,7 @@ impl Settings {
                                         }
                                     }
                                 }
-                                '\n' | '#' | '\0' | _ if cursor.current().1.is_whitespace() => break 'number,
+                                '\n' | '#' | '\0' | _ if current.is_whitespace() => break 'number,
                                 other => {
                                     if !other.is_ascii_digit() {
                                         err!("Expected an ascii digit or '.' while parsing a number, found '{}'.", other);
@@ -465,6 +462,7 @@ fn correct() {
     name = "aa"
     -a_ = 2
     shorhand_decimal = .1
+    aaaaa = .1 # more edge cases >:
     c = 32.0
     0Bbia3 = "test"
     far     =       42

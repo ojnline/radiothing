@@ -76,7 +76,7 @@ impl DeviceGroup {
 
         let auto_select = QCheckBox::new();
         auto_select.set_text(&qs("Auto select device"));
-        auto_select.set_checked(settings.auto_select_device);
+        auto_select.set_checked(settings.auto_device);
         layout.add_widget(&auto_select);
 
         let entry = QLineEdit::new();
@@ -242,7 +242,7 @@ impl DeviceGroup {
     }
     unsafe fn populate_settings(&self, settings: &mut AppSettings) {
         let AppSettings {
-            auto_select_device,
+            auto_device: auto_select_device,
             device_filter,
             device,
             ..
@@ -960,7 +960,7 @@ impl OutputGroup {
 
 #[derive(Clone, Debug)]
 struct AppSettings {
-    auto_select_device: bool,
+    auto_device: bool,
     device_filter: String,
     device: String,
 
@@ -975,7 +975,7 @@ struct AppSettings {
 impl AppSettings {
     fn pretty_serialize(&self) -> String {
         let AppSettings {
-            auto_select_device,
+            auto_device: auto_select_device,
             device_filter,
             device,
             auto_update,
@@ -1016,7 +1016,7 @@ auto_update = {:8}      # whether to update the receiver configuration immediate
 }
 
 const DEFAULT_SETTINGS: AppSettings = AppSettings {
-    auto_select_device: false,
+    auto_device: false,
     device_filter: String::new(),
     device: String::new(),
 
@@ -1051,10 +1051,7 @@ Options:
             // this error is emitted if there is no argument and the option is last in the invocation
             // ie 'radioting -c' triggers it, this isn't really an error if the value is optional
             // however the parsing function 'find_value' isn't given that information
-            Err(pico_args::Error::OptionWithoutAValue(_)) => {
-                println!("Hmm");
-                None
-            }
+            Err(pico_args::Error::OptionWithoutAValue(_)) => None,
             Err(e) => {
                 log::error!("Error parsing args: {}", e);
                 std::process::exit(1);
@@ -1070,6 +1067,7 @@ Options:
     }
 
     if args.contains("--create-config") {
+        // for some reason here the OptionWithoutAValue error isn't emitted? why?
         let path = handle_error(args.opt_value_from_str("--create-config")).unwrap_or_else(|| {
             std::env::current_dir()
                 .unwrap()
@@ -1147,14 +1145,14 @@ Options:
                         ($($field:ident),* $(,)*) => {
                             AppSettings {
                                 $(
-                                    $field: settings.get(stringify!($field)).unwrap_or(DEFAULT_SETTINGS.$field),
+                                    $field: settings.get(stringify!($field)).unwrap(),
                                 )*
                             }
                         }
                     }
 
                 let settings = settings_from_settings! {
-                    auto_select_device,
+                    auto_device,
                     device,
                     device_filter,
                     auto_update,
