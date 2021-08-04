@@ -1044,6 +1044,24 @@ Options:
 -h, --help            Print this help.
 ";
 
+    // we want to exit on any errors here, also it seems that optional values don't play well with the parsing mechanism
+    fn handle_error(result: Result<Option<PathBuf>, pico_args::Error>) -> Option<PathBuf> {
+        match result {
+            Ok(ok) => ok,
+            // this error is emitted if there is no argument and the option is last in the invocation
+            // ie 'radioting -c' triggers it, this isn't really an error if the value is optional
+            // however the parsing function 'find_value' isn't given that information
+            Err(pico_args::Error::OptionWithoutAValue(_)) => {
+                println!("Hmm");
+                None
+            }
+            Err(e) => {
+                log::error!("Error parsing args: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let mut args = pico_args::Arguments::from_env();
 
     if args.contains(["-h", "--help"]) {
@@ -1052,14 +1070,11 @@ Options:
     }
 
     if args.contains("--create-config") {
-        let path = args
-            .opt_value_from_str("--create-config")
-            .unwrap()
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap()
-                    .join("radiothing_config.txt")
-            });
+        let path = handle_error(args.opt_value_from_str("--create-config")).unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap()
+                .join("radiothing_config.txt")
+        });
 
         log::info!(
             "Creating default configuration at '{}'",
@@ -1079,17 +1094,14 @@ Options:
     }
 
     if !args.contains(["-i", "--ignore-config"]) {
-        let path = args
-            .opt_value_from_str(["-c", "--config"])
-            .unwrap()
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap()
-                    .join("radiothing_config.txt")
-            });
+        let path = handle_error(args.opt_value_from_str(["-c", "--config"])).unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap()
+                .join("radiothing_config.txt")
+        });
 
         let save_path =
-            if let Some(save) = args.opt_value_from_str(["-s", "--save-config"]).unwrap() {
+            if let Some(save) = handle_error(args.opt_value_from_str(["-s", "--save-config"])) {
                 Some(save)
             } else if args.contains(["-s", "--save-config"]) {
                 Some(path.clone())
