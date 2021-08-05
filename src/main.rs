@@ -284,7 +284,9 @@ struct ReceiveGroup {
     form_layout: QBox<QFormLayout>,
 
     value_ranges: RefCell<Option<ValueRanges>>,
+    current_values: Cell<Option<ReceiverState>>,
     device: Rc<DeviceManager>,
+    settings: Rc<AppSettings>,
 }
 
 impl ReceiveGroup {
@@ -308,16 +310,22 @@ impl ReceiveGroup {
 
         let frequency = QDoubleSpinBox::new_0a();
         frequency.set_suffix(&qs(" MHz"));
+        // start with practically unlimited range so that the following set_value isn't accidentally rounded
+        // the correct range is later set when the actual Device is created and queried for ranges  
+        // TODO maybe leave the range uncapped this way and rely only on the clamp_value function
+        frequency.set_range(0.0, 10000.0);
         frequency.set_value(settings.frequency);
         form_layout.add_row_q_string_q_widget(&qs("Frequency"), &frequency);
 
         let samplerate = QDoubleSpinBox::new_0a();
         samplerate.set_suffix(&qs(" MSps"));
+        samplerate.set_range(0.0, 10000.0);
         samplerate.set_value(settings.samplerate);
         form_layout.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
 
         let gain = QDoubleSpinBox::new_0a();
         gain.set_suffix(&qs(" dB"));
+        gain.set_range(0.0, 10000.0);
         gain.set_value(settings.gain);
         form_layout.add_row_q_string_q_widget(&qs("Gain"), &gain);
 
@@ -347,7 +355,9 @@ impl ReceiveGroup {
             form_layout,
 
             value_ranges: RefCell::new(None),
+            current_values: Cell::new(None),
             device,
+            settings,
         });
 
         s.group.set_enabled(false);
@@ -355,7 +365,8 @@ impl ReceiveGroup {
 
         (s, ptr)
     }
-    unsafe fn values_changed(&self) {
+    unsafe fn update_receiver_configuration(&self) {
+
         // everything is in megahertz or megasamples/second
         const MIL: f64 = 1_000_000.0;
 
@@ -388,18 +399,29 @@ impl ReceiveGroup {
             automatic_dc_offset: self.automatic_dc_offset.is_checked(),
         };
 
+        // nothing changed, this is possible because this function is called on editing_finished signal from qt
+        // this signal gets sent if for example you click into the value field of a spinbox and then focus something else
+        // without actually changing anything
+
+        // Cell is repr(transparent) so it is valid to compare it with a value of the inner Type
+        if Some(&state) == (&*self.current_values.as_ptr()).as_ref() { // Cell<Option<T>> -> *const Option<T> -> &Option<T> -> Option<&T>
+            return;
+        } else {
+            self.current_values.set(Some(state.clone()));
+        }
+
         handle_send_result(
             self.device
                 .send_command(DeviceBoundCommand::SetReceiver(state)),
         );
 
-        // this is the first point in program execution where the receiver get actually configured ad is usable,
+        // this is the first point in program execution where the receiver actually gets configured and is usable,
         // therefore here we check if there are any existing requests (the configuration was only updated,
         // not configured for the first time) and if not we inject them to be pingponged between this thread and the worker
         if self.device.get_data_requests_in_flight() == 0 {
             for _ in 0..DATA_REQUESTS_IN_FLIGHT {
                 let command = DeviceBoundCommand::RequestData {
-                    data: FftData::new(1024),
+                    data: FftData::new(SAMPLE_COUNT*16),
                 };
 
                 handle_send_result(self.device.send_command(command));
@@ -426,7 +448,7 @@ impl ReceiveGroup {
                 s.apply_btn.set_enabled(enabled);
 
                 if state == CheckState::Checked.into() {
-                    s.values_changed();
+                    s.update_receiver_configuration();
                 }
             }));
 
@@ -445,7 +467,7 @@ impl ReceiveGroup {
                         drop(ranges);
 
                         if s.automatic_update.is_checked() {
-                            s.values_changed();
+                            s.update_receiver_configuration();
                         }
                     }));
             };
@@ -458,7 +480,7 @@ impl ReceiveGroup {
         let s = self.clone();
         let checkbox_slot = SlotNoArgs::new(group, move || {
             if s.automatic_update.is_checked() {
-                s.values_changed();
+                s.update_receiver_configuration();
             }
         });
 
@@ -469,15 +491,10 @@ impl ReceiveGroup {
         apply_btn
             .clicked()
             .connect(&SlotNoArgs::new(group, move || {
-                s.values_changed();
+                s.update_receiver_configuration();
             }));
     }
     unsafe fn handle_event(self: &Rc<Self>, event: &mut Option<GuiBoundEvent>) {
-        {
-            let enabled = self.device.get_device_valid();
-            self.group.set_enabled(enabled);
-        }
-
         match event.as_ref().unwrap() {
             // it is incredibly ugly to be doing this replacement here and everytime the device changes
             // but this wouldn't be a gui project without bad code
@@ -487,23 +504,35 @@ impl ReceiveGroup {
                 // everything is in megahertz or megasamples/second
                 const MIL: f64 = 1_000_000.0;
 
+                // remove the samplerate widget, it will be replaced later
                 self.form_layout.remove_row_int(1);
 
                 // the device supports only discreet samplerates
                 if ranges.samplerate[0].minimum == ranges.samplerate[0].maximum {
                     let combox = QComboBox::new_0a();
 
-                    for range in &ranges.samplerate {
+                    // the index of the samplerate loaded from AppSettings
+                    // if it is not found, fall back to 0
+                    let mut set_samplerate_index = 0;
+
+                    for (i, range) in ranges.samplerate.iter().enumerate() {
                         let label = format!("{} MSps", range.minimum / MIL);
                         combox.add_item_q_string(&qs(label));
+
+                        if range.minimum / MIL == self.settings.samplerate {
+                            // index is found
+                            set_samplerate_index = i;
+                        }
                     }
+
+                    combox.set_current_index(set_samplerate_index as i32);
 
                     let s = self.clone();
                     combox
                         .current_index_changed()
                         .connect(&SlotNoArgs::new(&combox, move || {
                             if s.automatic_update.is_checked() {
-                                s.values_changed();
+                                s.update_receiver_configuration();
                             }
                         }));
 
@@ -531,6 +560,8 @@ impl ReceiveGroup {
                     let spinbox = QDoubleSpinBox::new_0a();
                     spinbox.set_range(min / MIL, max / MIL);
 
+                    spinbox.set_value(self.settings.samplerate);
+
                     let s = self.clone();
                     spinbox
                         .editing_finished()
@@ -546,7 +577,7 @@ impl ReceiveGroup {
                             drop(ranges);
 
                             if s.automatic_update.is_checked() {
-                                s.values_changed();
+                                s.update_receiver_configuration();
                             }
                         }));
 
@@ -591,7 +622,18 @@ impl ReceiveGroup {
                 scale_to_mega(&mut ranges.frequency);
                 scale_to_mega(&mut ranges.bandwidth);
 
+                log::debug!("Receiver value ranges: {:#?}", ranges);
+
                 self.value_ranges.replace(Some(ranges));
+
+                if self.automatic_update.is_checked() {
+                    self.update_receiver_configuration();
+                }
+
+                self.group.set_enabled(true);
+            }
+            GuiBoundEvent::DeviceDestroyed => {
+                self.group.set_enabled(false);
             }
             _ => (),
         }
@@ -934,11 +976,19 @@ impl OutputGroup {
                 let len = data.get_output().len();
                 let averaged_signal = data
                     .get_input()
-                    .chunks(4)
-                    .map(|chunks| chunks.iter().map(|c| c.re).sum::<RxFormat>() as f64 / 4.0);
-                let averaged_spectrum = data.get_output()[0..(len / 2 + 1)]
-                    .chunks(4)
-                    .map(|chunks| chunks.iter().map(|c| c.re).sum::<RxFormat>() as f64 / 4.0);
+                    .chunks(16)
+                    .map(|chunks| chunks[0].re as f64);
+                let averaged_spectrum = 
+                    data.get_output()[..(len / 2 + 1)]
+                    .chunks(16)
+                    .map(|chunks| chunks[0].re as f64);
+                // let averaged_signal = data
+                //     .get_input()
+                //     .chunks(16)
+                //     .map(|chunks| chunks.iter().map(|c| c.re).sum::<RxFormat>() as f64 / 16.0);
+                // let averaged_spectrum = data.get_output()[0..(len / 2 + 1)]
+                //     .chunks(16)
+                //     .map(|chunks| chunks.iter().map(|c| c.re).sum::<RxFormat>() as f64 / 16.0);
 
                 self.signal.add_new_data(averaged_signal, coloring_fn);
                 self.spectrum.add_new_data(averaged_spectrum, coloring_fn);

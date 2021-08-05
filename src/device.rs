@@ -32,7 +32,7 @@ pub enum GuiBoundEvent {
     DataReady { data: FftData<RxFormat> },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReceiverState {
     pub channel: usize,
     pub samplerate: f64,
@@ -218,6 +218,7 @@ pub type RxFormat = f32;
 enum DeviceWorkerError {
     MainThreadTerminated,
     SoapyError(soapysdr::Error),
+    WorkerError(&'static str)
 }
 
 impl Display for DeviceWorkerError {
@@ -227,6 +228,7 @@ impl Display for DeviceWorkerError {
                 writeln!(f, "The main thread has terminated before the worker.")
             }
             DeviceWorkerError::SoapyError(e) => writeln!(f, "SoapySDR Error: {}", e),
+            DeviceWorkerError::WorkerError(e) => writeln!(f, "Worker Error: {}", e),
         }
     }
 }
@@ -242,6 +244,12 @@ impl From<soapysdr::Error> for DeviceWorkerError {
 impl<T> From<crossbeam_channel::SendError<T>> for DeviceWorkerError {
     fn from(_: crossbeam_channel::SendError<T>) -> Self {
         DeviceWorkerError::MainThreadTerminated
+    }
+}
+
+impl From<&'static str> for DeviceWorkerError {
+    fn from(error: &'static str) -> Self {
+        DeviceWorkerError::WorkerError(error)
     }
 }
 
@@ -316,6 +324,7 @@ impl DeviceWorker {
                     }
                     DeviceBoundCommand::DestroyDevice => {
                         self.receive_stream = None;
+                        self.receive_state = None;
                         self.device = None;
 
                         self.sender.send(GuiBoundEvent::DeviceDestroyed)?;
@@ -341,17 +350,6 @@ impl DeviceWorker {
                     DeviceBoundCommand::SetReceiver(state) => {
                         assert!(self.device.is_some());
 
-                        // compares the new state to the one currently set and if they differ (or the previous state is unset, this is why it's so ugly) run the block
-                        macro_rules! if_differs {
-                            ($($var:ident, $then:expr);+ $(;)?) => {
-                                $(
-                                    if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
-                                        $then;
-                                    }
-                                );+
-                            }
-                        }
-
                         log::trace!("Configuring receiver:\n{:#?}", state);
 
                         let ReceiverState {
@@ -364,31 +362,58 @@ impl DeviceWorker {
                             automatic_dc_offset,
                         } = state.clone();
 
+                        assert!(channel == 0, "Currently channel is hardcoded as 0");
+
                         let dev = self.device.as_ref().unwrap();
 
-                        let mut antennas = dev.antennas(Rx, channel)?;
+                        // if let Some(stream) = self.receive_stream.as_mut() {
+                        //     // deactivate the stream before configuring
+                        //     stream.deactivate(None)?;
+                        // }
 
-                        dev.set_antenna(
-                            Rx,
-                            channel,
-                            antennas.pop().expect("No receiving antennas on channel."),
-                        )?;
+                        // this is the first SetReceiver command after this Device was created
+                        if self.receive_state.is_none() {
+                            let antenna = dev.antennas(Rx, channel)?.pop().ok_or("No receiving antennas on device.")?; // I know it should be antennae
+
+                            log::debug!("Selecting antenna '{}'", antenna);
+
+                            dev.set_antenna(
+                                Rx,
+                                channel,
+                                antenna,
+                            )?;
+
+                        }
+                        
+                        self.receive_stream = None;
+                        // channel is hardcoded so that this setup can be done only once after creating the device
+                        // making it actually be configurable wouldn't be hard
+                        let stream = dev.rx_stream::<Complex<RxFormat>>(&[0])?;
+                        self.receive_stream = Some(stream);
+
+                        // compares the new state to the one currently set and if they differ (or the previous state is unset, this is why it's so ugly) run the block
+                        macro_rules! if_differs {
+                            ($($var:ident, $then:expr);+ $(;)?) => {
+                                $(
+                                    $then
+                                    // if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
+                                    //     $then;
+                                    // }
+                                );+
+                            }
+                        }
 
                         // this is the result of excessive bikeshedding
                         if_differs!(
+                            automatic_gain, dev.set_gain_mode(Rx, channel, automatic_gain)?;
+                            automatic_dc_offset, dev.set_dc_offset_mode(Rx, channel, automatic_dc_offset)?;
                             gain,       dev.set_gain(Rx, channel, gain)?;
                             frequency,  dev.set_frequency(Rx, channel, frequency, ())?; // FIXME are the args neccessary for anything?
                             samplerate, dev.set_sample_rate(Rx, channel, samplerate)?;
                             bandwidth,  dev.set_bandwidth(Rx, channel, bandwidth)?;
-                            automatic_gain, dev.set_gain_mode(Rx, channel, automatic_gain)?;
-                            automatic_dc_offset, dev.set_dc_offset_mode(Rx, channel, automatic_dc_offset)?;
-                            channel, {
-                                self.receive_stream = None;
-                                let mut new_receiver = dev.rx_stream::<Complex<RxFormat>>(&[channel])?;
-                                new_receiver.activate(None)?;
-                                self.receive_stream = Some(new_receiver);
-                            };
                         );
+                        
+                        self.receive_stream.as_mut().unwrap().activate(None)?;
 
                         self.receive_state = Some(state);
                     }
