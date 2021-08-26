@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    convert::{TryFrom, TryInto},
-    error::Error,
-    fmt::Display,
-    path::Path,
-};
+use std::{collections::HashMap, convert::TryFrom, error::Error, fmt::Display, path::Path};
 
 #[derive(Clone, Debug)]
 pub enum Field {

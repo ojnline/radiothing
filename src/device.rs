@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     error::Error,
     fmt::Display,
+    mem::ManuallyDrop,
     thread::{self, JoinHandle},
     time::Duration,
     usize,
@@ -81,9 +82,9 @@ impl Display for WorkerPoisoned {
 impl Error for WorkerPoisoned {}
 
 struct InnerDeviceManager {
-    thread: JoinHandle<()>,
-    sender: Sender<DeviceBoundCommand>,
-    receiver: Receiver<GuiBoundEvent>,
+    thread: ManuallyDrop<JoinHandle<()>>,
+    sender: ManuallyDrop<Sender<DeviceBoundCommand>>,
+    receiver: ManuallyDrop<Receiver<GuiBoundEvent>>,
 
     device_valid: bool,
     receiver_valid: bool,
@@ -114,9 +115,9 @@ impl InnerDeviceManager {
             .unwrap();
 
         Self {
-            thread,
-            sender: device_sender_channel,
-            receiver: gui_receive_channel,
+            thread: ManuallyDrop::new(thread),
+            sender: ManuallyDrop::new(device_sender_channel),
+            receiver: ManuallyDrop::new(gui_receive_channel),
 
             device_valid: false,
             receiver_valid: false,
@@ -181,6 +182,22 @@ impl InnerDeviceManager {
     }
 }
 
+impl Drop for InnerDeviceManager {
+    fn drop(&mut self) {
+        // first ensure that both of the channels close
+        // on the worker thread this makes it exit it's toplevel function
+        unsafe {
+            ManuallyDrop::drop(&mut self.receiver);
+            ManuallyDrop::drop(&mut self.sender);
+        }
+
+        let thread = unsafe { ManuallyDrop::take(&mut self.thread) };
+
+        // after the thread has exited it can be joined
+        let _ = thread.join();
+    }
+}
+
 pub struct DeviceManager(RefCell<InnerDeviceManager>);
 impl DeviceManager {
     pub fn new() -> Self {
@@ -218,7 +235,7 @@ pub type RxFormat = f32;
 enum DeviceWorkerError {
     MainThreadTerminated,
     SoapyError(soapysdr::Error),
-    WorkerError(&'static str)
+    WorkerError(&'static str),
 }
 
 impl Display for DeviceWorkerError {
@@ -362,43 +379,41 @@ impl DeviceWorker {
                             automatic_dc_offset,
                         } = state.clone();
 
+                        // this is because changing channels after the device was created is unimplemented
+                        // and would result in weirdness, currently it's fine as it is hardcoded on the other side to 0
                         assert!(channel == 0, "Currently channel is hardcoded as 0");
 
                         let dev = self.device.as_ref().unwrap();
 
-                        // if let Some(stream) = self.receive_stream.as_mut() {
-                        //     // deactivate the stream before configuring
-                        //     stream.deactivate(None)?;
-                        // }
+                        if let Some(stream) = self.receive_stream.as_mut() {
+                            // deactivate the stream before configuring
+                            // this is not overly conservative because the ui emits SetReceiver
+                            // only if something in the state changed
+                            stream.deactivate(None)?;
+                        }
 
                         // this is the first SetReceiver command after this Device was created
                         if self.receive_state.is_none() {
-                            let antenna = dev.antennas(Rx, channel)?.pop().ok_or("No receiving antennas on device.")?; // I know it should be antennae
+                            let antenna = dev
+                                .antennas(Rx, channel)?
+                                .pop()
+                                .ok_or("No receiving antennas on device.")?; // I know it should be antennae
 
                             log::debug!("Selecting antenna '{}'", antenna);
 
-                            dev.set_antenna(
-                                Rx,
-                                channel,
-                                antenna,
-                            )?;
+                            dev.set_antenna(Rx, channel, antenna)?;
 
+                            let stream = dev.rx_stream(&[channel])?;
+                            self.receive_stream = Some(stream);
                         }
-                        
-                        self.receive_stream = None;
-                        // channel is hardcoded so that this setup can be done only once after creating the device
-                        // making it actually be configurable wouldn't be hard
-                        let stream = dev.rx_stream::<Complex<RxFormat>>(&[0])?;
-                        self.receive_stream = Some(stream);
 
                         // compares the new state to the one currently set and if they differ (or the previous state is unset, this is why it's so ugly) run the block
                         macro_rules! if_differs {
                             ($($var:ident, $then:expr);+ $(;)?) => {
                                 $(
-                                    $then
-                                    // if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
-                                    //     $then;
-                                    // }
+                                    if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
+                                        $then;
+                                    }
                                 );+
                             }
                         }
@@ -412,7 +427,7 @@ impl DeviceWorker {
                             samplerate, dev.set_sample_rate(Rx, channel, samplerate)?;
                             bandwidth,  dev.set_bandwidth(Rx, channel, bandwidth)?;
                         );
-                        
+
                         self.receive_stream.as_mut().unwrap().activate(None)?;
 
                         self.receive_state = Some(state);

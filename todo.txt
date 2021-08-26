@@ -1,0 +1,8 @@
+bolt in rtty decoding
+matching correct UKHAS packets
+reporting messages to user & habhub
+improve waterfall - freq scale, performance improvements
+multi-stage signal decimation
+put descriptions in the begginings of source files
+
+? IQ file playback
