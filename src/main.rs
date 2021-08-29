@@ -4,33 +4,35 @@ use std::{path::PathBuf, rc::Rc};
 
 use app_settings::{AppSettings, DEFAULT_SETTINGS};
 use device::{DeviceManager, GuiBoundEvent};
+use gui_groups::decode_group::DecodeGroup;
+use gui_groups::habhub_group::HabhubGroup;
 use gui_groups::{
     device_group::DeviceGroup, output_group::OutputGroup, receive_group::ReceiveGroup,
 };
 use qt_charts::qt_core::{QTimer, SlotNoArgs};
-use qt_widgets::{
-    qt_core::{qs, QBox},
-    QApplication, QGroupBox, QHBoxLayout, QLineEdit, QVBoxLayout, QWidget,
-};
+use qt_widgets::{qt_core::QBox, QApplication, QHBoxLayout, QVBoxLayout, QWidget};
+
 use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftNum, FftPlanner};
 
 pub mod app_settings;
-pub mod decode;
 pub mod device;
 pub mod gui_groups;
 pub mod settings;
 
 pub const SAMPLE_COUNT: usize = 256;
 
-pub const DATA_REQUESTS_IN_FLIGHT: usize = 8;
+pub const DATA_REQUESTS_IN_FLIGHT: usize = 4;
 
 #[allow(unused)]
 struct App {
     root: QBox<QWidget>,
-    v_layout: QBox<QVBoxLayout>,
+    v_layout_left: QBox<QVBoxLayout>,
+    v_layout_right: QBox<QVBoxLayout>,
     device_group: Rc<DeviceGroup>,
     receive_group: Rc<ReceiveGroup>,
+    decode_group: Rc<DecodeGroup>,
     output_group: Rc<OutputGroup>,
+    habhub_group: Rc<HabhubGroup>,
 
     device: Rc<DeviceManager>,
     settings: Rc<AppSettings>,
@@ -47,50 +49,45 @@ impl App {
         let root = QWidget::new_0a();
         let h_layout = QHBoxLayout::new_1a(&root);
 
-        let v_layout = QVBoxLayout::new_0a();
-
-        h_layout.add_layout_1a(&v_layout);
+        // LEFT
+        let v_layout_left = QVBoxLayout::new_0a();
+        h_layout.add_layout_1a(&v_layout_left);
 
         let (device_group, group) = DeviceGroup::new(device.clone(), settings.clone());
-        v_layout.add_widget(group);
+        v_layout_left.add_widget(group);
 
         let (receive_group, group) = ReceiveGroup::new(device.clone(), settings.clone());
-        v_layout.add_widget(group);
-        {
-            let decode = QGroupBox::new();
-            decode.set_title(&qs("Decode"));
-            v_layout.add_widget(&decode);
-        }
-        v_layout.add_stretch_0a();
+        v_layout_left.add_widget(group);
 
+        let (decode_group, group) = DecodeGroup::new(device.clone(), settings.clone());
+        v_layout_left.add_widget(group);
+
+        v_layout_left.add_stretch_0a();
+
+        // MIDDLE
         let (output_group, group) = OutputGroup::new(device.clone());
         h_layout.add_widget(group);
 
-        let v_layout_r = QVBoxLayout::new_0a();
-        h_layout.add_layout_1a(&v_layout_r);
+        // RIGHT
+        let v_layout_right = QVBoxLayout::new_0a();
+        h_layout.add_layout_1a(&v_layout_right);
 
-        {
-            let habhub = QGroupBox::new();
-            habhub.set_title(&qs("Habhub"));
-            v_layout_r.add_widget(&habhub);
+        let (habhub_group, group) = HabhubGroup::new(device.clone(), settings.clone());
+        v_layout_right.add_widget(group);
 
-            let v = QVBoxLayout::new_0a();
-            habhub.set_layout(&v);
-
-            let listener_callsign = QLineEdit::new();
-            v.add_widget(&listener_callsign);
-        }
-
-        h_layout.add_stretch_0a();
+        v_layout_right.add_stretch_0a();
 
         root.show();
 
         Self {
             root,
+            v_layout_left,
+            v_layout_right,
             device_group,
             receive_group,
+            decode_group,
             output_group,
-            v_layout,
+            habhub_group,
 
             device,
             settings,
@@ -206,7 +203,10 @@ fn main() {
             };
             writeln!(buf, "{:5} {}", level, record.args())
         })
+        .target(env_logger::Target::Stderr)
         .init();
+
+    soapysdr::configure_logging();
 
     // FIXME
     // this is a bodge to fix qt from complaining about "QBasicTimer::start: QBasicTimer can only be used with threads started with QThread"
@@ -228,6 +228,8 @@ fn main() {
             match event {
                 Ok(Some(GuiBoundEvent::Error(e))) => {
                     log::error!("Device encountered an error: {}", e);
+                    a.device.set_receive_enabled(false);
+                    a.output_group.set_run(false);
                 }
                 Ok(mut event) => {
                     a.handle_event(&mut event);
@@ -236,6 +238,8 @@ fn main() {
                     log::error!("The receiver worker thread has panicked, resetting worker");
 
                     a.reset_worker();
+                    a.device.set_receive_enabled(false);
+                    a.output_group.set_run(false);
                 }
             }
         }));

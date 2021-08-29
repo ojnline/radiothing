@@ -6,15 +6,14 @@ use std::{
 
 use qt_charts::qt_core::{qs, CheckState, QBox, SlotNoArgs, SlotOfInt};
 use qt_widgets::{
-    cpp_core::Ptr, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QPushButton,
-    QVBoxLayout,
+    cpp_core::Ptr, q_form_layout::FieldGrowthPolicy, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFormLayout, QGroupBox, QPushButton, QVBoxLayout,
 };
 
 use crate::{
     app_settings::AppSettings,
     device::{DeviceBoundCommand, DeviceManager, GuiBoundEvent, ReceiverState, ValueRanges},
     gui_groups::handle_send_result,
-    FftData, DATA_REQUESTS_IN_FLIGHT, SAMPLE_COUNT,
 };
 
 enum Samplerate {
@@ -60,8 +59,10 @@ impl ReceiveGroup {
         automatic_update.set_text(&qs("Automatic update"));
         v.add_widget(&automatic_update);
 
-        let form_layout = QFormLayout::new_0a();
-        v.add_layout_1a(&form_layout);
+        let form = QFormLayout::new_0a();
+        // form.set_label_alignment(AlignmentFlag::AlignLeft.into());
+        form.set_field_growth_policy(FieldGrowthPolicy::AllNonFixedFieldsGrow);
+        v.add_layout_1a(&form);
         group.set_layout(&v);
 
         let frequency = QDoubleSpinBox::new_0a();
@@ -71,27 +72,27 @@ impl ReceiveGroup {
         // TODO maybe leave the range uncapped this way and rely only on the clamp_value function
         frequency.set_range(0.0, 10000.0);
         frequency.set_value(settings.frequency);
-        form_layout.add_row_q_string_q_widget(&qs("Frequency"), &frequency);
+        form.add_row_q_string_q_widget(&qs("Frequency"), &frequency);
 
         let samplerate = QDoubleSpinBox::new_0a();
         samplerate.set_suffix(&qs(" MSps"));
         samplerate.set_range(0.0, 10000.0);
         samplerate.set_value(settings.samplerate);
-        form_layout.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
+        form.add_row_q_string_q_widget(&qs("Samplerate"), &samplerate);
 
         let gain = QDoubleSpinBox::new_0a();
         gain.set_suffix(&qs(" dB"));
         gain.set_range(0.0, 10000.0);
         gain.set_value(settings.gain);
-        form_layout.add_row_q_string_q_widget(&qs("Gain"), &gain);
+        form.add_row_q_string_q_widget(&qs("Gain"), &gain);
 
         let automatic_gain = QCheckBox::new();
         automatic_gain.set_checked(settings.automatic_gain);
-        form_layout.add_row_q_string_q_widget(&qs("Automatic gain"), &automatic_gain);
+        form.add_row_q_string_q_widget(&qs("Automatic gain"), &automatic_gain);
 
         let automatic_dc_offset = QCheckBox::new();
         automatic_dc_offset.set_checked(settings.automatic_dc_offset);
-        form_layout.add_row_q_string_q_widget(&qs("Automatic DC offset"), &automatic_dc_offset);
+        form.add_row_q_string_q_widget(&qs("Automatic DC offset"), &automatic_dc_offset);
 
         let apply_btn = QPushButton::new();
         apply_btn.set_text(&qs("Apply"));
@@ -108,7 +109,7 @@ impl ReceiveGroup {
             automatic_dc_offset,
             apply_btn,
             group,
-            form_layout,
+            form_layout: form,
 
             value_ranges: RefCell::new(None),
             current_values: Cell::new(None),
@@ -121,7 +122,7 @@ impl ReceiveGroup {
 
         (s, ptr)
     }
-    unsafe fn update_receiver_configuration(&self) {
+    unsafe fn update_receiver_configuration(&self, force: bool) {
         // everything is in megahertz or megasamples/second
         const MIL: f64 = 1_000_000.0;
 
@@ -159,8 +160,8 @@ impl ReceiveGroup {
         // without actually changing anything
 
         // Cell is repr(transparent) so it is valid to compare it with a value of the inner Type
-        if Some(&state) == (&*self.current_values.as_ptr()).as_ref() {
-            // Cell<Option<T>> -> *const Option<T> -> &Option<T> -> Option<&T>
+        // Cell<Option<T>> -> *const Option<T> -> &Option<T> -> Option<&T>
+        if Some(&state) == (&*self.current_values.as_ptr()).as_ref() && force == false {
             return;
         } else {
             self.current_values.set(Some(state.clone()));
@@ -170,19 +171,6 @@ impl ReceiveGroup {
             self.device
                 .send_command(DeviceBoundCommand::SetReceiver(state)),
         );
-
-        // this is the first point in program execution where the receiver actually gets configured and is usable,
-        // therefore here we check if there are any existing requests (the configuration was only updated,
-        // not configured for the first time) and if not we inject them to be pingponged between this thread and the worker
-        if self.device.get_data_requests_in_flight() == 0 {
-            for _ in 0..DATA_REQUESTS_IN_FLIGHT {
-                let command = DeviceBoundCommand::RequestData {
-                    data: FftData::new(SAMPLE_COUNT),
-                };
-
-                handle_send_result(self.device.send_command(command));
-            }
-        }
     }
     unsafe fn init(self: &Rc<Self>) {
         let Self {
@@ -204,7 +192,7 @@ impl ReceiveGroup {
                 s.apply_btn.set_enabled(enabled);
 
                 if state == CheckState::Checked.into() {
-                    s.update_receiver_configuration();
+                    s.update_receiver_configuration(false);
                 }
             }));
 
@@ -223,7 +211,7 @@ impl ReceiveGroup {
                         drop(ranges);
 
                         if s.automatic_update.is_checked() {
-                            s.update_receiver_configuration();
+                            s.update_receiver_configuration(false);
                         }
                     }));
             };
@@ -236,7 +224,7 @@ impl ReceiveGroup {
         let s = self.clone();
         let checkbox_slot = SlotNoArgs::new(group, move || {
             if s.automatic_update.is_checked() {
-                s.update_receiver_configuration();
+                s.update_receiver_configuration(false);
             }
         });
 
@@ -247,7 +235,7 @@ impl ReceiveGroup {
         apply_btn
             .clicked()
             .connect(&SlotNoArgs::new(group, move || {
-                s.update_receiver_configuration();
+                s.update_receiver_configuration(false);
             }));
     }
     pub unsafe fn handle_event(self: &Rc<Self>, event: &mut Option<GuiBoundEvent>) {
@@ -288,7 +276,7 @@ impl ReceiveGroup {
                         .current_index_changed()
                         .connect(&SlotNoArgs::new(&combox, move || {
                             if s.automatic_update.is_checked() {
-                                s.update_receiver_configuration();
+                                s.update_receiver_configuration(false);
                             }
                         }));
 
@@ -333,7 +321,7 @@ impl ReceiveGroup {
                             drop(ranges);
 
                             if s.automatic_update.is_checked() {
-                                s.update_receiver_configuration();
+                                s.update_receiver_configuration(false);
                             }
                         }));
 
@@ -382,9 +370,8 @@ impl ReceiveGroup {
 
                 self.value_ranges.replace(Some(ranges));
 
-                if self.automatic_update.is_checked() {
-                    self.update_receiver_configuration();
-                }
+                // make sure that the device has "some" receive stream configured, if the values lead to a timeout error or similar, the sample retrieval will be paused
+                self.update_receiver_configuration(true);
 
                 self.group.set_enabled(true);
             }

@@ -114,7 +114,9 @@ impl DeviceGroup {
                 s.combo_box.set_enabled(!checked);
                 // start the refreshing pingpong
                 // FIXME clicking the refresh button from code is a very poorly searchable pattern
-                s.b1.click();
+                if checked {
+                    s.b1.click();
+                }
             }));
 
         let s = self.clone();
@@ -156,6 +158,7 @@ impl DeviceGroup {
         b3.clicked().connect(&SlotNoArgs::new(group, move || {
             handle_send_result(s.device.send_command(DeviceBoundCommand::DestroyDevice));
 
+            s.b2.set_enabled(true);
             s.b3.set_enabled(false);
         }));
     }
@@ -175,6 +178,12 @@ impl DeviceGroup {
                 for name in list {
                     self.combo_box.add_item_q_string(&qs(name.as_str()));
                 }
+
+                if self.device.get_device_valid() {
+                    return;
+                }
+
+                self.b2.set_enabled(!list.is_empty());
 
                 if self.auto_select.is_checked() {
                     // if there were no devices found, search again

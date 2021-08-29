@@ -1,211 +1,208 @@
-use std::cell::{Cell, RefCell};
-use std::ops::Range;
-use std::rc::Rc;
+use std::borrow::Borrow;
+use std::cell::Cell;
+use std::{ops::Range, rc::Rc};
+
+use crate::device::{DeviceBoundCommand, DeviceManager, GuiBoundEvent};
+use crate::gui_groups::handle_send_result;
+use crate::{FftData, DATA_REQUESTS_IN_FLIGHT, SAMPLE_COUNT};
 
 use qt_charts::{
-    cpp_core::CppBox,
-    qt_core::{AlignmentFlag, QRectF},
-    qt_gui::{q_image::Format, q_painter::RenderHint, QColor, QImage, QPixmap},
+    qt_core::{AlignmentFlag, QVectorOfQPointF, SlotNoArgs},
+    qt_gui::{q_font_database::SystemFont, q_painter::RenderHint, QFontDatabase},
     QChart, QChartView, QLineSeries, QValueAxis,
 };
 use qt_widgets::{
     cpp_core::Ptr,
-    q_layout::SizeConstraint,
+    q_size_policy::Policy,
+    q_style::StandardPixmap,
     qt_core::{qs, QBox},
-    QGridLayout, QGroupBox, QLabel, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QGridLayout, QGroupBox, QPushButton, QTextEdit,
 };
-
-use crate::device::{DeviceBoundCommand, DeviceManager, GuiBoundEvent};
-use crate::gui_groups::handle_send_result;
-use crate::SAMPLE_COUNT;
+use rustfft::num_complex::Complex32;
 
 #[allow(unused)]
-struct ShittySpectogram {
-    graph_width: Cell<u32>,
-    graph_height: Cell<u32>,
-    frequency_samples: Cell<u32>,
-    spectogram_history_count: Cell<u32>,
-    recreate_image: Cell<bool>,
-
-    widget: QBox<QWidget>,
+struct SingleSeriesGraph {
     chart: QBox<QChart>,
     view: QBox<QChartView>,
     series: QBox<QLineSeries>,
-    history_image: RefCell<CppBox<QImage>>,
-    pixlabel: QBox<QLabel>,
+
+    x_axis: QBox<QValueAxis>,
+    y_axis: QBox<QValueAxis>,
+    y_scale: Cell<f32>,
 }
 
-impl ShittySpectogram {
+impl SingleSeriesGraph {
     unsafe fn new(
-        graph_width: u32,
-        graph_height: u32,
-        frequency_samples: u32,
-        spectogram_history_count: u32,
-        x_range: Range<f64>,
-        y_range: Range<f64>,
-    ) -> (Self, Ptr<QWidget>) {
-        let layout = QVBoxLayout::new_0a();
-        let margin = layout.margin();
-        layout.set_size_constraint(SizeConstraint::SetMaximumSize);
-        layout.set_spacing(0);
-        layout.set_margin(0);
-
-        let widget = QWidget::new_0a();
-        // widget.set_size_policy_2a(Policy::Fixed, Policy::MinimumExpanding);
-        widget.set_layout(&layout);
-
+        x: Range<f64>,
+        y: f64,
+        x_label: &str,
+        y_label: &str,
+        title: &str,
+        y_axis_show_labels: bool,
+        show_markers: bool,
+        grid_visible: bool,
+    ) -> Self {
         let chart = QChart::new_0a();
 
-        let x_axis = QValueAxis::new_0a();
-        x_axis.set_range(x_range.start, x_range.end);
-        let y_axis = QValueAxis::new_0a();
-        y_axis.set_range(y_range.start, y_range.end);
-        y_axis.set_label_format(&qs(" "));
+        if title.is_empty() {
+            let margins = chart.margins();
+            margins.set_top((-margins.top() as f64 / 1.5) as i32);
+            chart.set_margins(&margins);
+        } else {
+            chart.set_title(&qs(title));
+        }
 
-        chart.add_axis(&x_axis, AlignmentFlag::AlignTop.into());
+        let x_axis = QValueAxis::new_0a();
+        let y_axis = QValueAxis::new_0a();
+
+        let point_size = x_axis.labels_font().point_size();
+        let mono_font = QFontDatabase::system_font(SystemFont::FixedFont);
+        mono_font.set_point_size(point_size);
+
+        x_axis.set_range(x.start, x.end);
+        x_axis.set_title_text(&qs(x_label));
+        x_axis.set_labels_font(&mono_font);
+
+        y_axis.set_range(-y, y);
+        y_axis.set_title_text(&qs(y_label));
+        y_axis.set_labels_font(&mono_font);
+
+        chart.add_axis(&x_axis, AlignmentFlag::AlignBottom.into());
         chart.add_axis(&y_axis, AlignmentFlag::AlignLeft.into());
 
         let series = QLineSeries::new_0a();
         chart.add_series(&series);
-        series.attach_axis(&x_axis);
+        // no x-axis is set and the series is empty so it seems that the series defaults to range 0..1
         series.attach_axis(&y_axis);
 
-        chart.legend().markers_0a().iter().for_each(|m| {
-            let m = m.as_ref().unwrap().as_ref().unwrap();
-            m.set_visible(false);
-        });
+        if !y_axis_show_labels {
+            y_axis.set_label_format(&qs(" "));
+        }
 
-        let graph_width_f = graph_width as f64;
-        let graph_height_f = graph_height as f64;
+        if !show_markers {
+            chart.legend().markers_0a().iter().for_each(|m| {
+                let m = m.as_ref().unwrap().as_ref().unwrap();
+                m.set_visible(false);
+            });
+        }
 
-        let graph_width_i = graph_width as i32;
-        let graph_height_i = graph_height as i32;
+        x_axis.set_grid_line_visible_1a(grid_visible);
+        y_axis.set_grid_line_visible_1a(grid_visible);
 
-        let y_space = 20.0;
-        chart.set_plot_area(&QRectF::from_4_double(
-            0.0,
-            y_space,
-            graph_width_f,
-            graph_height_f,
-        ));
+        let view = QChartView::from_q_chart(&chart);
+        view.set_render_hint_1a(RenderHint::Antialiasing);
+        view.set_size_policy_2a(Policy::MinimumExpanding, Policy::MinimumExpanding);
 
-        let chart_view = QChartView::from_q_chart(&chart);
-        chart_view.set_render_hint_1a(RenderHint::Antialiasing);
-        chart_view.set_minimum_size_2a(graph_width_i, graph_height_i + y_space as i32);
-        chart.set_background_roundness(0.0);
-        layout.add_widget(&chart_view);
-
-        let pixmap = QPixmap::from_2_int(frequency_samples as i32, spectogram_history_count as i32); // from_q_string(&qs("./bbb.jpg"));
-        pixmap.fill_1a(&QColor::from_rgb_3a(0, 0, 0));
-
-        let pixlabel = QLabel::new();
-        pixlabel.set_pixmap(&pixmap);
-        pixlabel.set_contents_margins_4a(margin, 0, margin, margin);
-        pixlabel.set_scaled_contents(true);
-        pixlabel.set_fixed_width(graph_width_i);
-        layout.add_widget(&pixlabel);
-        layout.add_stretch_0a();
-
-        let history_image = QImage::from_2_int_format(
-            frequency_samples as i32,
-            spectogram_history_count as i32,
-            Format::FormatRGB32,
-        );
-        history_image.fill_uint(0);
-
-        let ptr = widget.as_ptr();
-        let s = Self {
-            widget,
+        Self {
             chart,
-            view: chart_view,
+            view,
             series,
-            graph_width: Cell::new(graph_width),
-            graph_height: Cell::new(graph_height),
-            frequency_samples: Cell::new(frequency_samples),
-            spectogram_history_count: Cell::new(spectogram_history_count),
 
-            history_image: RefCell::new(history_image),
-            pixlabel,
-            recreate_image: Cell::new(false),
+            x_axis,
+            y_axis,
+            y_scale: Cell::new(y.abs() as f32),
+        }
+    }
+
+    // fill the QLineSeries in the graph with the entirety of y_samples
+    //  x is always scaled from 0..1
+    //  the imaginary part is discarded
+
+    // the safety of this is dubious at best but should work
+    pub unsafe fn update_series(
+        &self,
+        y_samples: &[Complex32],
+        fit_y: bool,
+        smoothing_factor: f32,
+        proportional_margin: f32,
+    ) {
+        if y_samples.len() < 2 {
+            return;
+        }
+
+        self.view.set_updates_enabled(false);
+
+        if fit_y {
+            let y_scale = self.y_scale.get();
+
+            let mut abs_max = 0.0f32;
+            for s in y_samples {
+                abs_max = abs_max.max(s.re.abs());
+            }
+
+            abs_max += abs_max * proportional_margin;
+            let new_y_scale = y_scale * smoothing_factor + abs_max * (1.0 - smoothing_factor);
+
+            self.y_axis
+                .set_range(-new_y_scale as f64, new_y_scale as f64);
+            self.y_scale.set(new_y_scale);
+        }
+
+        // QVector, like most Qt containers, is implicitly shared which allows us to update all the data at once in this roundabout way
+        let vector = self.series.points_vector();
+        {
+            let empty = QVectorOfQPointF::new_0a();
+            // remove the shared reference held by the series, otherwise resize() and more importantly data() would reallocate even though the size is the same and the old data is discarded
+            // look at the beautiful code here https://code.woboq.org/qt5/include/qt/QtCore/qvector.h.html#_ZN7QVector4dataEv
+            self.series.replace_q_vector_of_q_point_f(&empty);
+        }
+
+        // qt reallocates vectors even thought the previous size is larger than the requested size
+        // (this has now been changed but not backported)
+        if y_samples.len() as i32 > vector.size() {
+            vector.resize(y_samples.len() as i32);
+        }
+
+        // PointF source is here https://code.woboq.org/qt5/qtbase/src/corelib/tools/qpoint.h.html#QPointF::xp
+        // this is horrible hacking to be able to write the vector memory without calling qt functions which cannot be inlined
+        // due to cpp not having a stable abi, it is impossible to soundly bind field access so the field offsets are computed here
+
+        // with common sense, PointF should always have a stride of 16 bytes (2 doubles)
+        // but such speculation on memory layout is so horribly evil and not guaranteed
+        let pointf_stride = {
+            let ptr0 = vector.at(0).as_raw_ptr() as *const u8;
+            let ptr1 = vector.at(1).as_raw_ptr() as *const u8;
+
+            ptr1.offset_from(ptr0)
         };
 
-        (s, ptr)
-    }
+        let data_ptr = vector.data().as_mut_raw_ptr();
 
-    unsafe fn set_sample_count(&self, count: u32) {
-        self.recreate_image.set(true);
-        self.frequency_samples.set(count);
-    }
+        // most likely offset from the base pointer by 0 bytes
+        let x0 = (*data_ptr).rx() as *mut u8;
+        // most likely offset from the base pointer by 8 bytes
+        let y0 = (*data_ptr).ry() as *mut u8;
 
-    // resize and clear image
-    unsafe fn recreate_image(&self) {
-        let new_image = QImage::from_2_int_format(
-            self.frequency_samples.get() as i32,
-            self.spectogram_history_count.get() as i32,
-            Format::FormatRGB32,
-        );
-        new_image.fill_uint(0);
-        *self.history_image.borrow_mut() = new_image;
-        self.recreate_image.set(false);
-    }
+        // dbg!(pointf_stride);
+        // dbg!(x0.offset_from(data_ptr as *const u8));
+        // dbg!(y0.offset_from(data_ptr as *const u8));
 
-    unsafe fn add_new_data(
-        &self,
-        data: impl ExactSizeIterator<Item = f64>,
-        coloring_fn: unsafe fn(f64) -> CppBox<QColor>,
-    ) {
-        if self.frequency_samples.get() != data.len() as u32 {
-            self.set_sample_count(data.len() as u32);
+        let d_x = 1.0 / (y_samples.len() as f64);
+        let mut x = 0.0;
+
+        for (i, y) in y_samples.iter().enumerate() {
+            let y = y.re as f64;
+
+            (x0.offset(i as isize * pointf_stride) as *mut ::std::os::raw::c_double).write(x);
+            (y0.offset(i as isize * pointf_stride) as *mut ::std::os::raw::c_double).write(y);
+
+            x += d_x;
         }
 
-        self.series.clear();
-        let d_x = 1.0 / (data.len() as f64);
+        self.view.set_updates_enabled(true);
 
-        let is_spectogram = self.spectogram_history_count.get() != 0;
-
-        if is_spectogram {
-            if self.recreate_image.get() {
-                self.recreate_image();
-            } else {
-                // shift image data one row down
-                let samples = self.frequency_samples.get() as usize;
-                let row = self.history_image.borrow().scan_line_mut(0) as *mut u32;
-                std::ptr::copy(
-                    row,
-                    row.add(samples),
-                    samples * (self.spectogram_history_count.get() as usize - 1),
-                );
-            }
-
-            let row = self.history_image.borrow().scan_line_mut(0) as *mut u32;
-            for (i, p) in data.enumerate() {
-                self.series.append_2_double(d_x * i as f64, p);
-
-                let color = coloring_fn(p);
-                row.add(i).write(color.rgb());
-            }
-
-            let pixmap = QPixmap::from_image_1a(&*self.history_image.borrow());
-            self.pixlabel.set_pixmap(&pixmap);
-        } else {
-            for (i, p) in data.enumerate() {
-                self.series.append_2_double(d_x * i as f64, p);
-            }
-        }
-    }
-
-    unsafe fn clear(&self) {
-        self.series.clear();
-        self.pixlabel.clear();
+        self.series.replace_q_vector_of_q_point_f(&vector);
     }
 }
 
 #[allow(unused)]
 pub struct OutputGroup {
     group: QBox<QGroupBox>,
+    run: QBox<QPushButton>,
+    run_state: Cell<bool>,
     grid: QBox<QGridLayout>,
-    signal: ShittySpectogram,
-    spectrum: ShittySpectogram,
+    signal: SingleSeriesGraph,
+    spectrum: SingleSeriesGraph,
     text_edit: QBox<QTextEdit>,
 
     device: Rc<DeviceManager>,
@@ -216,50 +213,35 @@ impl OutputGroup {
         let group = QGroupBox::new();
         let grid = QGridLayout::new_0a();
 
-        grid.set_size_constraint(SizeConstraint::SetMaximumSize);
+        group.set_size_policy_2a(Policy::Expanding, Policy::Expanding);
         group.set_layout(&grid);
 
-        let signal = {
-            let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 0, 0.0..1.0, -2.5..2.5);
+        // the axis ranges are meaningless because they are overridden after the correct signals are bound in init()
+        let signal = SingleSeriesGraph::new(0.0..1.0, 0.1, "ms", "", "Signal", true, false, true);
+        grid.add_widget_3a(&signal.view, 0, 0);
 
-            let layout = QVBoxLayout::new_0a();
-            layout.add_widget(widget);
-
-            let group = QGroupBox::new();
-            group.set_layout(&layout);
-            group.set_flat(true);
-            group.set_title(&qs("Signal"));
-
-            grid.add_widget_3a(&group, 0, 0);
-
-            graph
-        };
-
-        let spectrum = {
-            let (graph, widget) =
-                ShittySpectogram::new(400, 300, SAMPLE_COUNT as u32, 40, 0.0..1.0, -10.0..150.0);
-
-            let layout = QVBoxLayout::new_0a();
-            layout.add_widget(widget);
-
-            let group = QGroupBox::new();
-            group.set_layout(&layout);
-            group.set_flat(true);
-            group.set_title(&qs("Spectrum"));
-
-            grid.add_widget_3a(&group, 0, 1);
-
-            graph
-        };
+        // the axis ranges are meaningless because they are overridden after the correct signals are bound in init()
+        let spectrum =
+            SingleSeriesGraph::new(0.0..1.0, 0.1, "Hz", "", "Spectrum", true, false, true);
+        grid.add_widget_3a(&spectrum.view, 0, 1);
 
         let text_edit = QTextEdit::new();
         text_edit.set_read_only(true);
         grid.add_widget_5a(&text_edit, 1, 0, 1, 2);
 
+        let run = QPushButton::new();
+        set_run_button_icon(&run, false);
+        run.set_icon_size(&(&*run.icon_size() * 1.5));
+        run.set_flat(true);
+        run.set_size_policy_2a(Policy::Fixed, Policy::Fixed);
+
+        grid.add_widget_6a(&run, 2, 0, 1, 2, AlignmentFlag::AlignCenter.into());
+
         let ptr = group.as_ptr();
         let s = Rc::new(Self {
             group,
+            run,
+            run_state: Cell::new(false),
             grid,
             signal,
             spectrum,
@@ -268,46 +250,98 @@ impl OutputGroup {
             device,
         });
 
+        s.init();
+
         (s, ptr)
+    }
+    unsafe fn init(self: &Rc<Self>) {
+        let Self { group, run, .. } = self.borrow();
+
+        let s = self.clone();
+        // FIXME deduplicate this from handle_event
+        run.clicked().connect(&SlotNoArgs::new(group, move || {
+            let run = !s.run_state.get();
+            s.run_state.set(run);
+
+            let enabled =
+                run == true && s.device.get_device_valid() && s.device.get_receiver_valid();
+
+            set_run_button_icon(&s.run, enabled);
+
+            if enabled {
+                s.device.set_receive_enabled(true);
+
+                for _ in 0..(DATA_REQUESTS_IN_FLIGHT
+                    .saturating_sub(s.device.get_data_requests_in_flight()))
+                {
+                    let command = DeviceBoundCommand::RequestData {
+                        data: FftData::new(SAMPLE_COUNT),
+                    };
+
+                    handle_send_result(s.device.send_command(command));
+                }
+            }
+        }));
     }
     pub unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
         match event.as_ref().unwrap() {
             GuiBoundEvent::DeviceCreated { .. } => {
-                self.signal.clear();
-                self.spectrum.clear();
-                self.text_edit.clear();
+                // self.signal.clear();
+                // self.spectrum.clear();
+                // self.text_edit.clear();
+
+                if self.run_state.get() && self.device.get_receiver_valid() {
+                    self.device.set_receive_enabled(true);
+
+                    for _ in 0..(DATA_REQUESTS_IN_FLIGHT
+                        .saturating_sub(self.device.get_data_requests_in_flight()))
+                    {
+                        let command = DeviceBoundCommand::RequestData {
+                            data: FftData::new(SAMPLE_COUNT),
+                        };
+
+                        handle_send_result(self.device.send_command(command));
+                    }
+                }
             }
             GuiBoundEvent::DecodedChars { data: _ } => todo!(),
             GuiBoundEvent::DataReady { data } => {
-                unsafe fn coloring_fn(f: f64) -> CppBox<QColor> {
-                    QColor::from_rgb_f_3a(f.ln() * 0.2, 0.0, 0.0)
+                if !(self.device.get_receiver_valid() && self.run_state.get()) {
+                    return;
                 }
 
-                const G: f32 = 20.0;
-                let averaged_signal = data.get_input().iter().map(|s| (G * s.re) as f64);
-                let averaged_spectrum = data.get_output().iter().map(|s| (G * s.re) as f64);
-                // let averaged_signal = data
-                //     .get_input()
-                //     .chunks(16)
-                //     .map(|chunks| chunks.iter().map(|c| c.re).sum::<RxFormat>() as f64 / 16.0);
-                // let averaged_spectrum = data.get_output()[0..(len / 2 + 1)]
-                //     .chunks(16)
-                //     .map(|chunks| chunks.iter().map(|c| c.re).sum::<RxFormat>() as f64 / 16.0);
+                let signal = data.get_input();
+                let spectrum = data.get_output();
 
-                self.signal.add_new_data(averaged_signal, coloring_fn);
-                self.spectrum.add_new_data(averaged_spectrum, coloring_fn);
+                self.signal.update_series(signal, true, 0.9, 0.2);
+                self.spectrum.update_series(spectrum, true, 0.9, 0.2);
 
-                if self.device.get_receiver_valid() {
-                    match event.take().unwrap() {
-                        GuiBoundEvent::DataReady { data } => handle_send_result(
-                            self.device
-                                .send_command(DeviceBoundCommand::RequestData { data }),
-                        ),
-                        _ => unreachable!(),
-                    };
-                }
+                match event.take().unwrap() {
+                    GuiBoundEvent::DataReady { data } => handle_send_result(
+                        self.device
+                            .send_command(DeviceBoundCommand::RequestData { data }),
+                    ),
+                    _ => unreachable!(),
+                };
+            }
+            GuiBoundEvent::DeviceDestroyed | GuiBoundEvent::WorkerReset => {
+                self.set_run(false);
             }
             _ => (),
         }
     }
+    pub unsafe fn set_run(&self, run: bool) {
+        self.run.set_checked(run);
+        set_run_button_icon(&self.run, run);
+        self.run_state.set(run);
+    }
+}
+
+unsafe fn set_run_button_icon(button: &QPushButton, state: bool) {
+    let icon = match state {
+        true => QApplication::style().standard_icon_1a(StandardPixmap::SPMediaPause),
+        false => QApplication::style().standard_icon_1a(StandardPixmap::SPMediaPlay),
+    };
+
+    button.set_icon(&icon);
 }

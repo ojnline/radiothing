@@ -3,6 +3,10 @@ use std::{
     error::Error,
     fmt::Display,
     mem::ManuallyDrop,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::Duration,
     usize,
@@ -82,14 +86,15 @@ impl Display for WorkerPoisoned {
 impl Error for WorkerPoisoned {}
 
 struct InnerDeviceManager {
-    thread: ManuallyDrop<JoinHandle<()>>,
-    sender: ManuallyDrop<Sender<DeviceBoundCommand>>,
-    receiver: ManuallyDrop<Receiver<GuiBoundEvent>>,
+    pub(crate) thread: ManuallyDrop<JoinHandle<()>>,
+    pub(crate) sender: ManuallyDrop<Sender<DeviceBoundCommand>>,
+    pub(crate) receive_enable_flag: Arc<AtomicBool>,
+    pub(crate) receiver: ManuallyDrop<Receiver<GuiBoundEvent>>,
 
-    device_valid: bool,
-    receiver_valid: bool,
-    refreshing_devices: bool,
-    get_data_requests_in_flight: usize,
+    pub(crate) device_valid: bool,
+    pub(crate) receiver_valid: bool,
+    pub(crate) refreshing_devices: bool,
+    pub(crate) data_requests_in_flight: usize,
 }
 
 impl InnerDeviceManager {
@@ -97,10 +102,15 @@ impl InnerDeviceManager {
         let (gui_sender_channel, gui_receive_channel) = crossbeam_channel::unbounded();
         let (device_sender_channel, device_receive_channel) = crossbeam_channel::unbounded();
 
+        let receive_enable_flag = Arc::new(AtomicBool::new(false));
+        let receive_enable_flag_c = receive_enable_flag.clone();
+
         let thread = thread::Builder::new()
             .name("Worker thread".to_owned())
             .spawn(move || {
                 let worker = DeviceWorker {
+                    receive_stream_active: false,
+                    receive_enable_flag,
                     receiver: device_receive_channel,
                     sender: gui_sender_channel,
                     available_devices: None,
@@ -117,25 +127,14 @@ impl InnerDeviceManager {
         Self {
             thread: ManuallyDrop::new(thread),
             sender: ManuallyDrop::new(device_sender_channel),
+            receive_enable_flag: receive_enable_flag_c,
             receiver: ManuallyDrop::new(gui_receive_channel),
 
             device_valid: false,
             receiver_valid: false,
             refreshing_devices: false,
-            get_data_requests_in_flight: 0,
+            data_requests_in_flight: 0,
         }
-    }
-    fn get_device_valid(&mut self) -> bool {
-        self.device_valid
-    }
-    fn get_receiver_valid(&mut self) -> bool {
-        self.receiver_valid
-    }
-    fn get_refreshing_devices(&mut self) -> bool {
-        self.refreshing_devices
-    }
-    fn get_data_requests_in_flight(&mut self) -> usize {
-        self.get_data_requests_in_flight
     }
     fn send_command(&mut self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
         match &command {
@@ -154,7 +153,7 @@ impl InnerDeviceManager {
                     self.device_valid = true;
                 }
             }
-            &DeviceBoundCommand::RequestData { .. } => self.get_data_requests_in_flight += 1,
+            &DeviceBoundCommand::RequestData { .. } => self.data_requests_in_flight += 1,
             DeviceBoundCommand::RefreshDevices { .. } => self.refreshing_devices = true,
             DeviceBoundCommand::SetReceiver(_) => self.receiver_valid = true,
         }
@@ -169,7 +168,7 @@ impl InnerDeviceManager {
         if let Ok(event) = event.as_ref() {
             match event {
                 GuiBoundEvent::RefreshedDevices { .. } => self.refreshing_devices = false,
-                GuiBoundEvent::DataReady { .. } => self.get_data_requests_in_flight -= 1,
+                GuiBoundEvent::DataReady { .. } => self.data_requests_in_flight -= 1,
                 _ => (),
             }
         }
@@ -204,16 +203,16 @@ impl DeviceManager {
         Self(RefCell::new(InnerDeviceManager::new()))
     }
     pub fn get_device_valid(&self) -> bool {
-        self.0.borrow_mut().get_device_valid()
+        self.0.borrow().device_valid
     }
     pub fn get_receiver_valid(&self) -> bool {
-        self.0.borrow_mut().get_receiver_valid()
+        self.0.borrow().receiver_valid
     }
     pub fn get_refreshing_devices(&self) -> bool {
-        self.0.borrow_mut().get_refreshing_devices()
+        self.0.borrow().refreshing_devices
     }
     pub fn get_data_requests_in_flight(&self) -> usize {
-        self.0.borrow_mut().get_data_requests_in_flight()
+        self.0.borrow().data_requests_in_flight
     }
     pub fn send_command(&self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
         self.0.borrow_mut().send_command(command)
@@ -222,8 +221,21 @@ impl DeviceManager {
         self.0.borrow_mut().try_receive()
     }
 
+    pub fn set_receive_enabled(&self, enabled: bool) {
+        self.0
+            .borrow()
+            .receive_enable_flag
+            .store(enabled, Ordering::SeqCst);
+    }
+
     pub fn reset(&self) {
-        *self.0.borrow_mut() = InnerDeviceManager::new();
+        let ptr = self.0.as_ptr();
+
+        unsafe {
+            ptr.drop_in_place();
+            let new = InnerDeviceManager::new();
+            ptr.write(new);
+        }
     }
 }
 
@@ -271,6 +283,11 @@ impl From<&'static str> for DeviceWorkerError {
 }
 
 struct DeviceWorker {
+    // this is an atomic bool rather than a message in the channel because there may be multiple data requests queued at a time
+    // this was mostly implemented to quickly react to
+    receive_enable_flag: Arc<AtomicBool>,
+    receive_stream_active: bool,
+
     receiver: Receiver<DeviceBoundCommand>,
     sender: Sender<GuiBoundEvent>,
 
@@ -296,13 +313,34 @@ impl DeviceWorker {
 
         loop {
             // this will block until there is a command available, this is hopefully implemented with the proper primitives so the thread won't spin the cpu endlessly
-            let event = match self.receiver.recv_timeout(Duration::from_millis(2)) {
+            let event = match self.receiver.recv_timeout(Duration::from_millis(5)) {
                 Ok(event) => Some(event),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(DeviceWorkerError::MainThreadTerminated)
                 }
             };
+
+            // if let Some(event) = &event {
+            //     dbg!(event);
+            // }
+
+            let receive = self.receive_enable_flag.load(Ordering::SeqCst);
+
+            // react to change in receive_enable_flag
+            if let Some(stream) = self.receive_stream.as_mut() {
+                match (receive, self.receive_stream_active) {
+                    (true, false) => {
+                        stream.activate(None)?;
+                        self.receive_stream_active = true;
+                    }
+                    (false, true) => {
+                        stream.deactivate(None)?;
+                        self.receive_stream_active = false;
+                    }
+                    _ => {}
+                }
+            }
 
             if let Some(event) = event {
                 match event {
@@ -340,6 +378,8 @@ impl DeviceWorker {
                         self.device = Some(dev);
                     }
                     DeviceBoundCommand::DestroyDevice => {
+                        self.receive_enable_flag.store(false, Ordering::SeqCst);
+                        self.receive_stream_active = false;
                         self.receive_stream = None;
                         self.receive_state = None;
                         self.device = None;
@@ -385,12 +425,13 @@ impl DeviceWorker {
 
                         let dev = self.device.as_ref().unwrap();
 
-                        if let Some(stream) = self.receive_stream.as_mut() {
-                            // deactivate the stream before configuring
-                            // this is not overly conservative because the ui emits SetReceiver
-                            // only if something in the state changed
-                            stream.deactivate(None)?;
-                        }
+                        // it is seemingly not neccessary to deactivate the stream before configuring
+                        // I'm still going to keep this code here
+
+                        // if self.receive_stream.is_some() && self.receive_stream_active {
+                        //     // deactivate the stream before configuring
+                        //     self.receive_stream.as_mut().unwrap().deactivate(None)?;
+                        // }
 
                         // this is the first SetReceiver command after this Device was created
                         if self.receive_state.is_none() {
@@ -428,7 +469,9 @@ impl DeviceWorker {
                             bandwidth,  dev.set_bandwidth(Rx, channel, bandwidth)?;
                         );
 
-                        self.receive_stream.as_mut().unwrap().activate(None)?;
+                        // if self.receive_stream_active {
+                        //     self.receive_stream.as_mut().unwrap().activate(None)?;
+                        // }
 
                         self.receive_state = Some(state);
                     }
@@ -446,9 +489,12 @@ impl DeviceWorker {
                 }
             }
 
-            if let Some(stream) = self.receive_stream.as_mut() {
-                let _read_count =
-                    stream.read(&mut [self.working_memory.as_mut()], RECEIVE_TIMEOUT_US)?;
+            if self.receive_stream.is_some() && self.receive_stream_active {
+                let _read_count = self
+                    .receive_stream
+                    .as_mut()
+                    .unwrap()
+                    .read(&mut [self.working_memory.as_mut()], RECEIVE_TIMEOUT_US)?;
             }
         }
     }
@@ -465,6 +511,11 @@ impl DeviceWorker {
                 }
                 _ => unreachable!(), // the error_process() function only ever returns through null coalescing operators and as such always an error
             }
+
+            // sleep some time so that the main thread has time to handle the error and possibly disable this thread
+            // that can happen for example after an error because the receive stream is misconfigured with a wrong frequency
+            // this is not a race condition hack per se it just keeps the worker from trigerring the error again before it is handled
+            std::thread::sleep(std::time::Duration::from_millis(110));
         }
     }
 }
