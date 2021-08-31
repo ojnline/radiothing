@@ -29,6 +29,7 @@ struct SingleSeriesGraph {
     x_axis: QBox<QValueAxis>,
     y_axis: QBox<QValueAxis>,
     y_scale: Cell<f32>,
+    smoothed_y_scale: Cell<f32>,
 }
 
 impl SingleSeriesGraph {
@@ -101,6 +102,7 @@ impl SingleSeriesGraph {
             x_axis,
             y_axis,
             y_scale: Cell::new(y.abs() as f32),
+            smoothed_y_scale: Cell::new(y.abs() as f32),
         }
     }
 
@@ -123,19 +125,28 @@ impl SingleSeriesGraph {
         self.view.set_updates_enabled(false);
 
         if fit_y {
-            let y_scale = self.y_scale.get();
-
             let mut abs_max = 0.0f32;
             for s in y_samples {
                 abs_max = abs_max.max(s.re.abs());
             }
 
             abs_max += abs_max * proportional_margin;
-            let new_y_scale = y_scale * smoothing_factor + abs_max * (1.0 - smoothing_factor);
+            let new_y_scale =
+                self.smoothed_y_scale.get() * smoothing_factor + abs_max * (1.0 - smoothing_factor);
 
-            self.y_axis
-                .set_range(-new_y_scale as f64, new_y_scale as f64);
-            self.y_scale.set(new_y_scale);
+            self.smoothed_y_scale.set(new_y_scale);
+
+            // the scale lowers to match the smoothed scale only if it is off by at least 20% of the current scale
+            const MIN_PROPORTIONAL_DELTA: f32 = 0.2;
+
+            let y_scale = self.y_scale.get();
+            // set the new range if it is bigger than the previous one or if it is smaller by at least a proportional delta
+            if new_y_scale > y_scale || new_y_scale / y_scale < (1.0 - MIN_PROPORTIONAL_DELTA) {
+                self.y_scale.set(new_y_scale);
+
+                self.y_axis
+                    .set_range(-new_y_scale as f64, new_y_scale as f64);
+            }
         }
 
         // QVector, like most Qt containers, is implicitly shared which allows us to update all the data at once in this roundabout way
