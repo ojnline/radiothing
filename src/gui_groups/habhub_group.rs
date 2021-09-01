@@ -1,14 +1,15 @@
 use std::rc::Rc;
 
+use crate::app_settings::AppSettings;
+use crate::worker::worker::GuiBoundEvent;
+use crate::worker::worker_manager::{DeviceManager};
+
 use qt_widgets::{
     cpp_core::Ptr,
     q_size_policy::Policy,
     qt_core::{qs, QBox},
     QCheckBox, QFormLayout, QGroupBox, QLineEdit,
 };
-
-use crate::app_settings::AppSettings;
-use crate::device::{DeviceManager, GuiBoundEvent};
 
 pub enum Mode {
     Baudot {

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::{path::PathBuf, rc::Rc};
 
 use app_settings::{AppSettings, DEFAULT_SETTINGS};
-use device::{DeviceManager, GuiBoundEvent};
 use gui_groups::decode_group::DecodeGroup;
 use gui_groups::habhub_group::HabhubGroup;
 use gui_groups::{
@@ -13,11 +12,15 @@ use qt_charts::qt_core::{QTimer, SlotNoArgs};
 use qt_widgets::{qt_core::QBox, QApplication, QHBoxLayout, QVBoxLayout, QWidget};
 
 use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftNum, FftPlanner};
+use worker::worker::GuiBoundEvent;
+use worker::worker_manager::{DeviceManager};
 
 pub mod app_settings;
-pub mod device;
+pub mod decoder;
+pub mod dsp;
 pub mod gui_groups;
 pub mod settings;
+pub mod worker;
 
 pub const SAMPLE_COUNT: usize = 256;
 
@@ -105,7 +108,7 @@ impl App {
             }
         }
 
-        chain_handle_events! {event, self.device_group, self.receive_group, self.output_group};
+        chain_handle_events! {event, self.device_group, self.receive_group, self.decode_group, self.output_group};
     }
     unsafe fn reset_worker(&self) {
         self.device.reset();

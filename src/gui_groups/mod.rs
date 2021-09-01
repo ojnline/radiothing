@@ -4,7 +4,7 @@ pub mod habhub_group;
 pub mod output_group;
 pub mod receive_group;
 
-use crate::device::DeviceError;
+use crate::worker::worker_manager::DeviceError;
 
 // crash on BadState, ignore WorkerPoisoned because it will be handled in the next iteration
 // previously the code ws just unwrapping the result which enabled a race condition when the worker thread has just closed

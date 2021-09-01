@@ -2,8 +2,9 @@ use std::borrow::Borrow;
 use std::cell::Cell;
 use std::{ops::Range, rc::Rc};
 
-use crate::device::{DeviceBoundCommand, DeviceManager, GuiBoundEvent};
 use crate::gui_groups::handle_send_result;
+use crate::worker::worker::{DeviceBoundCommand, GuiBoundEvent};
+use crate::worker::worker_manager::{DeviceManager};
 use crate::{FftData, DATA_REQUESTS_IN_FLIGHT, SAMPLE_COUNT};
 
 use qt_charts::{
@@ -315,7 +316,9 @@ impl OutputGroup {
                     }
                 }
             }
-            GuiBoundEvent::DecodedChars { data: _ } => todo!(),
+            GuiBoundEvent::DecodedChars { data } => {
+                // self.text_edit.insert_plain_text(&qs(data.as_str()));
+            }
             GuiBoundEvent::DataReady { data } => {
                 if !(self.device.get_receiver_valid() && self.run_state.get()) {
                     return;

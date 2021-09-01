@@ -10,7 +10,8 @@ use qt_widgets::{
 };
 
 use crate::app_settings::AppSettings;
-use crate::device::{DeviceBoundCommand, DeviceManager, GuiBoundEvent};
+use crate::worker::worker::{DeviceBoundCommand, GuiBoundEvent};
+use crate::worker::worker_manager::{DeviceManager};
 
 use super::handle_send_result;
 

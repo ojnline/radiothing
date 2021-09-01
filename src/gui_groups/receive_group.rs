@@ -10,11 +10,9 @@ use qt_widgets::{
     QFormLayout, QGroupBox, QPushButton, QVBoxLayout,
 };
 
-use crate::{
-    app_settings::AppSettings,
-    device::{DeviceBoundCommand, DeviceManager, GuiBoundEvent, ReceiverState, ValueRanges},
-    gui_groups::handle_send_result,
-};
+use crate::{app_settings::AppSettings, gui_groups::handle_send_result, worker::{worker::{DeviceBoundCommand, GuiBoundEvent}, worker_manager::{
+        DeviceManager, ReceiverState, ValueRanges,
+    }}};
 
 enum Samplerate {
     Ranges(QBox<QDoubleSpinBox>),

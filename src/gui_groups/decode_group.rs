@@ -1,7 +1,9 @@
 use std::rc::Rc;
 
 use crate::app_settings::AppSettings;
-use crate::device::{DeviceManager, GuiBoundEvent};
+use crate::decoder::BaudotDecoder;
+use crate::worker::worker::{DeviceBoundCommand, GuiBoundEvent};
+use crate::worker::worker_manager::{DeviceManager};
 
 use qt_widgets::{
     cpp_core::Ptr,
@@ -10,14 +12,7 @@ use qt_widgets::{
     QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGroupBox, QSpinBox,
 };
 
-pub enum Coding {
-    Baudot {
-        baudrate: f32,
-        stop_bits: f32,
-        decimation: usize,
-        freq_shift: f32,
-    },
-}
+use super::handle_send_result;
 
 #[allow(unused)]
 pub struct DecodeGroup {
@@ -81,7 +76,16 @@ impl DecodeGroup {
     unsafe fn init(self: &Rc<Self>) {}
     pub unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
         match event.as_ref().unwrap() {
-            _ => (),
+            GuiBoundEvent::DeviceCreated {..} => {
+                let decoder = Box::new(BaudotDecoder::new(50.0, 1.5));
+
+                let command = DeviceBoundCommand::SetDecoder {
+                    decoder,
+                };
+
+                // handle_send_result(self.device.send_command(command));
+            },
+            _ => {}
         };
     }
     pub unsafe fn populate_settings(&self, settings: &mut AppSettings) {}

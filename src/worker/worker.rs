@@ -1,30 +1,35 @@
+use super::worker_manager::ReceiverState;
+use crate::{
+    decoder::Decoder,
+    dsp::fir_filter::FirFilter,
+    worker::worker_manager::{ChannelInfo, ValueRanges},
+    FftData,
+};
+
 use std::{
-    cell::RefCell,
     error::Error,
     fmt::Display,
-    mem::ManuallyDrop,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::{self, JoinHandle},
     time::Duration,
     usize,
 };
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustfft::num_complex::Complex;
-use soapysdr::{Args, Device, Direction::Rx, Range, RxStream};
+use soapysdr::{Args, Device, Direction::Rx, RxStream};
 
-use crate::FftData;
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum DeviceBoundCommand {
     DestroyDevice, // FIXME is this neccessary
     CreateDevice { index: usize },
     RefreshDevices { args: String },
     SetReceiver(ReceiverState),
     RequestData { data: FftData<RxFormat> },
+    SetDecoder { decoder: Box<dyn Decoder> },
 }
 #[derive(Debug)]
 pub enum GuiBoundEvent {
@@ -37,217 +42,12 @@ pub enum GuiBoundEvent {
     DataReady { data: FftData<RxFormat> },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReceiverState {
-    pub channel: usize,
-    pub samplerate: f64,
-    pub frequency: f64,
-    pub bandwidth: f64,
-    pub gain: f64,
-    pub automatic_gain: bool,
-    pub automatic_dc_offset: bool,
-}
-
 #[derive(Debug)]
-pub struct ChannelInfo {
-    pub ranges: ValueRanges,
-    pub info: Vec<(String, String)>, // (key, value)
-}
-
-#[derive(Clone, Debug)]
-pub struct ValueRanges {
-    pub samplerate: Vec<Range>,
-    pub frequency: Vec<Range>,
-    pub bandwidth: Vec<Range>,
-    pub gain: Range,
-}
-#[derive(Clone, Debug)]
-pub enum DeviceError {
-    BadState,
-    WorkerPoisoned,
-}
-impl Display for DeviceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeviceError::BadState => writeln!(f, "The application is in a bad state."),
-            DeviceError::WorkerPoisoned => writeln!(f, "The receive thread has panicked."),
-        }
-    }
-}
-impl Error for DeviceError {}
-
-#[derive(Clone, Debug)]
-pub struct WorkerPoisoned;
-impl Display for WorkerPoisoned {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "The receive thread has panicked.")
-    }
-}
-impl Error for WorkerPoisoned {}
-
-struct InnerDeviceManager {
-    pub(crate) thread: ManuallyDrop<JoinHandle<()>>,
-    pub(crate) sender: ManuallyDrop<Sender<DeviceBoundCommand>>,
-    pub(crate) receive_enable_flag: Arc<AtomicBool>,
-    pub(crate) receiver: ManuallyDrop<Receiver<GuiBoundEvent>>,
-
-    pub(crate) device_valid: bool,
-    pub(crate) receiver_valid: bool,
-    pub(crate) refreshing_devices: bool,
-    pub(crate) data_requests_in_flight: usize,
-}
-
-impl InnerDeviceManager {
-    fn new() -> Self {
-        let (gui_sender_channel, gui_receive_channel) = crossbeam_channel::unbounded();
-        let (device_sender_channel, device_receive_channel) = crossbeam_channel::unbounded();
-
-        let receive_enable_flag = Arc::new(AtomicBool::new(false));
-        let receive_enable_flag_c = receive_enable_flag.clone();
-
-        let thread = thread::Builder::new()
-            .name("Worker thread".to_owned())
-            .spawn(move || {
-                let worker = DeviceWorker {
-                    receive_stream_active: false,
-                    receive_enable_flag,
-                    receiver: device_receive_channel,
-                    sender: gui_sender_channel,
-                    available_devices: None,
-                    device: None,
-                    receive_state: None,
-                    receive_stream: None,
-                    working_memory: Box::new([Default::default(); RECEIVE_SIZE]),
-                };
-
-                worker.process();
-            })
-            .unwrap();
-
-        Self {
-            thread: ManuallyDrop::new(thread),
-            sender: ManuallyDrop::new(device_sender_channel),
-            receive_enable_flag: receive_enable_flag_c,
-            receiver: ManuallyDrop::new(gui_receive_channel),
-
-            device_valid: false,
-            receiver_valid: false,
-            refreshing_devices: false,
-            data_requests_in_flight: 0,
-        }
-    }
-    fn send_command(&mut self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
-        match &command {
-            DeviceBoundCommand::DestroyDevice => {
-                if self.device_valid {
-                    self.device_valid = false;
-                    self.receiver_valid = false;
-                } else {
-                    return Err(DeviceError::BadState);
-                }
-            }
-            DeviceBoundCommand::CreateDevice { .. } => {
-                if self.device_valid {
-                    return Err(DeviceError::BadState);
-                } else {
-                    self.device_valid = true;
-                }
-            }
-            &DeviceBoundCommand::RequestData { .. } => self.data_requests_in_flight += 1,
-            DeviceBoundCommand::RefreshDevices { .. } => self.refreshing_devices = true,
-            DeviceBoundCommand::SetReceiver(_) => self.receiver_valid = true,
-        }
-
-        self.sender
-            .send(command)
-            .map_err(|_| DeviceError::WorkerPoisoned)
-    }
-    fn try_receive(&mut self) -> Result<Option<GuiBoundEvent>, WorkerPoisoned> {
-        let event = self.receiver.try_recv();
-
-        if let Ok(event) = event.as_ref() {
-            match event {
-                GuiBoundEvent::RefreshedDevices { .. } => self.refreshing_devices = false,
-                GuiBoundEvent::DataReady { .. } => self.data_requests_in_flight -= 1,
-                _ => (),
-            }
-        }
-
-        match event {
-            Ok(event) => return Ok(Some(event)),
-            Err(TryRecvError::Disconnected) => return Err(WorkerPoisoned),
-            Err(TryRecvError::Empty) => return Ok(None),
-        }
-    }
-}
-
-impl Drop for InnerDeviceManager {
-    fn drop(&mut self) {
-        // first ensure that both of the channels close
-        // on the worker thread this makes it exit it's toplevel function
-        unsafe {
-            ManuallyDrop::drop(&mut self.receiver);
-            ManuallyDrop::drop(&mut self.sender);
-        }
-
-        let thread = unsafe { ManuallyDrop::take(&mut self.thread) };
-
-        // after the thread has exited it can be joined
-        let _ = thread.join();
-    }
-}
-
-pub struct DeviceManager(RefCell<InnerDeviceManager>);
-impl DeviceManager {
-    pub fn new() -> Self {
-        Self(RefCell::new(InnerDeviceManager::new()))
-    }
-    pub fn get_device_valid(&self) -> bool {
-        self.0.borrow().device_valid
-    }
-    pub fn get_receiver_valid(&self) -> bool {
-        self.0.borrow().receiver_valid
-    }
-    pub fn get_refreshing_devices(&self) -> bool {
-        self.0.borrow().refreshing_devices
-    }
-    pub fn get_data_requests_in_flight(&self) -> usize {
-        self.0.borrow().data_requests_in_flight
-    }
-    pub fn send_command(&self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
-        self.0.borrow_mut().send_command(command)
-    }
-    pub fn try_receive(&self) -> Result<Option<GuiBoundEvent>, WorkerPoisoned> {
-        self.0.borrow_mut().try_receive()
-    }
-
-    pub fn set_receive_enabled(&self, enabled: bool) {
-        self.0
-            .borrow()
-            .receive_enable_flag
-            .store(enabled, Ordering::SeqCst);
-    }
-
-    pub fn reset(&self) {
-        let ptr = self.0.as_ptr();
-
-        unsafe {
-            ptr.drop_in_place();
-            let new = InnerDeviceManager::new();
-            ptr.write(new);
-        }
-    }
-}
-
-const RECEIVE_SIZE: usize = 16 * 1024;
-const RECEIVE_TIMEOUT_US: i64 = 200_000; // 200 miliseconds
-pub type RxFormat = f32;
-
-#[derive(Clone, Debug)]
 enum DeviceWorkerError {
     MainThreadTerminated,
     SoapyError(soapysdr::Error),
     WorkerError(&'static str),
+    DecoderError(&'static str),
 }
 
 impl Display for DeviceWorkerError {
@@ -258,6 +58,7 @@ impl Display for DeviceWorkerError {
             }
             DeviceWorkerError::SoapyError(e) => writeln!(f, "SoapySDR Error: {}", e),
             DeviceWorkerError::WorkerError(e) => writeln!(f, "Worker Error: {}", e),
+            DeviceWorkerError::DecoderError(e) => writeln!(f, "Decoder Error: {}", e),
         }
     }
 }
@@ -282,26 +83,57 @@ impl From<&'static str> for DeviceWorkerError {
     }
 }
 
-struct DeviceWorker {
+const INITIAL_RECEIVE_SIZE: usize = 16 * 1024;
+const RECEIVE_TIMEOUT_US: i64 = 200_000; // 200 miliseconds
+pub type RxFormat = f32;
+
+pub struct DeviceWorker {
     // this is an atomic bool rather than a message in the channel because there may be multiple data requests queued at a time
     // this was mostly implemented to quickly react to
-    receive_enable_flag: Arc<AtomicBool>,
-    receive_stream_active: bool,
+    pub(crate) receive_enable_flag: Arc<AtomicBool>,
+    pub(crate) receive_stream_active: bool,
 
-    receiver: Receiver<DeviceBoundCommand>,
-    sender: Sender<GuiBoundEvent>,
+    pub(crate) receiver: Receiver<DeviceBoundCommand>,
+    pub(crate) sender: Sender<GuiBoundEvent>,
 
-    available_devices: Option<Vec<Args>>,
-    device: Option<Device>,
+    pub(crate) available_devices: Option<Vec<Args>>,
+    pub(crate) device: Option<Device>,
 
-    receive_state: Option<ReceiverState>,
-    receive_stream: Option<RxStream<Complex<RxFormat>>>,
+    pub(crate) receive_state: Option<ReceiverState>,
+    pub(crate) receive_stream: Option<RxStream<Complex<RxFormat>>>,
 
-    // TODO revamp the way data is read and decoded
-    working_memory: Box<[Complex<RxFormat>; RECEIVE_SIZE]>,
+    pub(crate) decoder: Option<Box<dyn Decoder>>,
+
+    pub(crate) working_memory: Vec<Complex<RxFormat>>,
+    pub(crate) memory_receive_offset: usize,
+
+    // TODO expand the caching mechanism or throw it away
+    pub(crate) decimation_fir_cache: Vec<(u32, Rc<FirFilter>)>,
 }
 
+// TODO receive mtu() counts of data for maximum efficiency
+
 impl DeviceWorker {
+    pub fn new(
+        receiver: Receiver<DeviceBoundCommand>,
+        sender: Sender<GuiBoundEvent>,
+        receive_enable_flag: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            receive_enable_flag,
+            receive_stream_active: false,
+            receiver,
+            sender,
+            available_devices: None,
+            device: None,
+            receive_state: None,
+            receive_stream: None,
+            decoder: None,
+            working_memory: vec![Default::default(); INITIAL_RECEIVE_SIZE],
+            memory_receive_offset: 0,
+            decimation_fir_cache: Vec::new(),
+        }
+    }
     fn error_process(&mut self) -> Result<(), DeviceWorkerError> {
         fn clone_args(a: &Args) -> Args {
             let mut c = Args::new();
@@ -312,7 +144,6 @@ impl DeviceWorker {
         }
 
         loop {
-            // this will block until there is a command available, this is hopefully implemented with the proper primitives so the thread won't spin the cpu endlessly
             let event = match self.receiver.recv_timeout(Duration::from_millis(5)) {
                 Ok(event) => Some(event),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -320,10 +151,6 @@ impl DeviceWorker {
                     return Err(DeviceWorkerError::MainThreadTerminated)
                 }
             };
-
-            // if let Some(event) = &event {
-            //     dbg!(event);
-            // }
 
             let receive = self.receive_enable_flag.load(Ordering::SeqCst);
 
@@ -340,6 +167,15 @@ impl DeviceWorker {
                     }
                     _ => {}
                 }
+            }
+
+            if self.receive_stream.is_some() && self.receive_stream_active {
+                let dst = &mut self.working_memory[self.memory_receive_offset..];
+                let _read_count = self
+                    .receive_stream
+                    .as_mut()
+                    .unwrap()
+                    .read(&mut [dst], RECEIVE_TIMEOUT_US)?;
             }
 
             if let Some(event) = event {
@@ -383,6 +219,7 @@ impl DeviceWorker {
                         self.receive_stream = None;
                         self.receive_state = None;
                         self.device = None;
+                        self.decoder = None;
 
                         self.sender.send(GuiBoundEvent::DeviceDestroyed)?;
                     }
@@ -450,14 +287,14 @@ impl DeviceWorker {
 
                         // compares the new state to the one currently set and if they differ (or the previous state is unset, this is why it's so ugly) run the block
                         macro_rules! if_differs {
-                            ($($var:ident, $then:expr);+ $(;)?) => {
-                                $(
-                                    if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
-                                        $then;
-                                    }
-                                );+
+                                ($($var:ident, $then:expr);+ $(;)?) => {
+                                    $(
+                                        if Some($var) != self.receive_state.as_ref().map(|s| s.$var) {
+                                            $then;
+                                        }
+                                    );+
+                                }
                             }
-                        }
 
                         // this is the result of excessive bikeshedding
                         if_differs!(
@@ -474,31 +311,53 @@ impl DeviceWorker {
                         // }
 
                         self.receive_state = Some(state);
+
+                        // everyone loves the option dance (yes it's actually called that)
+                        if let Some(mut decoder) = self.decoder.take() {
+                            decoder
+                                .configuration_changed(self)
+                                .map_err(|e| DeviceWorkerError::DecoderError(e))?;
+
+                            self.decoder = Some(decoder);
+                        }
                     }
                     DeviceBoundCommand::RequestData { mut data } => {
                         assert!(self.receive_stream.is_some());
                         assert!(data.get_input().len() <= self.working_memory.len());
 
                         let len = data.get_input().len();
+                        let offset = self.memory_receive_offset;
                         data.get_input_mut()
-                            .copy_from_slice(&mut self.working_memory[0..len]);
+                            .copy_from_slice(&mut self.working_memory[offset..(len + offset)]);
                         data.process();
 
                         self.sender.send(GuiBoundEvent::DataReady { data })?;
+                    }
+                    DeviceBoundCommand::SetDecoder { mut decoder } => {
+                        let prev = self.decoder.take();
+                        decoder
+                            .init(self, prev)
+                            .map_err(|e| DeviceWorkerError::DecoderError(e))?;
+                        self.decoder = Some(decoder);
                     }
                 }
             }
 
             if self.receive_stream.is_some() && self.receive_stream_active {
-                let _read_count = self
-                    .receive_stream
-                    .as_mut()
-                    .unwrap()
-                    .read(&mut [self.working_memory.as_mut()], RECEIVE_TIMEOUT_US)?;
+                // println!("BBBBBB");
+                // this horrible thing is needed to satisfy the borrowchecker
+                // since Option<Box<_>> is just a pointer, it's very cheap to move even if it isn't optimized away
+                if let Some(mut decoder) = self.decoder.take() {
+                    decoder
+                        .process(self)
+                        .map_err(|e| DeviceWorkerError::DecoderError(e))?;
+
+                    self.decoder = Some(decoder);
+                }
             }
         }
     }
-    fn process(mut self) {
+    pub fn process(mut self) {
         loop {
             let result = self.error_process();
 
