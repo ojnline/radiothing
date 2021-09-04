@@ -233,17 +233,10 @@ fn main() {
 
     soapysdr::configure_logging();
 
-    // FIXME
-    // this is a bodge to fix qt from complaining about "QBasicTimer::start: QBasicTimer can only be used with threads started with QThread"
-    // on application exit, apparently it often implies weird widget destruction order but leaving a reference here outside of QApplication::init
-    // fixes it somehow?
-    let mut keep_alive_outside_event_event_loop = None;
-
     QApplication::init(|qapp| unsafe {
         let app = Rc::new(App::new());
-        keep_alive_outside_event_event_loop = Some(app.clone());
 
-        let timer = QTimer::new_0a();
+        let timer = QTimer::new_1a(&app.root);
         timer.set_interval(16);
 
         let a = app.clone();
