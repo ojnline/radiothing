@@ -1,6 +1,9 @@
 use std::{any::Any, fmt::Debug, rc::Rc};
 
-use crate::{dsp::{fir_filter::FirFilter, rtty_decode}, worker::worker::{DeviceWorker, GuiBoundEvent}};
+use crate::{
+    dsp::{fir_filter::FirFilter, rtty_decode},
+    worker::worker::{DeviceWorker, GuiBoundEvent},
+};
 
 pub type DecoderResult<T> = Result<T, &'static str>;
 
@@ -50,18 +53,29 @@ impl Decoder for BaudotDecoder {
     }
 
     fn process(&mut self, worker: &mut DeviceWorker) -> DecoderResult<()> {
-
         let samplerate = worker.receive_state.as_mut().unwrap().samplerate as f32;
 
         // todo actually restore the previous samples
         let (string, _, _) = unsafe {
             // println!("AAAAA");
-            let a = rtty_decode::decode(worker.working_memory.as_ptr(), worker.working_memory.len(), worker.working_memory.as_mut_ptr() as *mut bool, 0, self.baudrate, samplerate, &mut self.letters);
+            let a = rtty_decode::decode(
+                worker.working_memory.as_ptr(),
+                worker.working_memory.len(),
+                worker.working_memory.as_mut_ptr() as *mut bool,
+                0,
+                self.baudrate,
+                samplerate,
+                &mut self.letters,
+            );
             // println!("BBBB");
             a
         };
 
-        let _ = worker.sender.send(GuiBoundEvent::DecodedChars { data: string });
+        if !string.is_empty() {
+            let _ = worker
+                .sender
+                .send(GuiBoundEvent::DecodedChars { data: string });
+        }
 
         Ok(())
     }

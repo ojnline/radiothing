@@ -11,7 +11,7 @@ use qt_widgets::{
 
 use crate::app_settings::AppSettings;
 use crate::worker::worker::{DeviceBoundCommand, GuiBoundEvent};
-use crate::worker::worker_manager::{DeviceManager};
+use crate::worker::worker_manager::DeviceManager;
 
 use super::handle_send_result;
 
@@ -29,6 +29,8 @@ pub struct DeviceGroup {
     device: Rc<DeviceManager>,
     settings: Rc<AppSettings>,
 }
+
+const DEVICES_REFRESH_INTERVAL_MS: u64 = 1000;
 
 impl DeviceGroup {
     pub unsafe fn new(
@@ -187,10 +189,12 @@ impl DeviceGroup {
                 self.b2.set_enabled(!list.is_empty());
 
                 if self.auto_select.is_checked() {
-                    // if there were no devices found, search again
-                    // FIXME would be better to do this less frequently
-                    if list.is_empty() {
-                        self.b1.click();
+                    if list.is_empty() && !self.device.get_refreshing_devices() {
+                        let filter = self.filter.text().to_std_string();
+                        self.device.schedule_command(
+                            DeviceBoundCommand::RefreshDevices { args: filter },
+                            DEVICES_REFRESH_INTERVAL_MS,
+                        );
                         return;
                     }
 

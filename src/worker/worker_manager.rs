@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::BinaryHeap,
     error::Error,
     fmt::Display,
     mem::ManuallyDrop,
@@ -8,12 +9,13 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use soapysdr::Range;
 
-use crate::{worker::worker::DeviceWorker};
+use crate::worker::worker::DeviceWorker;
 
 use super::worker::{DeviceBoundCommand, GuiBoundEvent};
 
@@ -65,6 +67,31 @@ impl Display for WorkerPoisoned {
 }
 impl Error for WorkerPoisoned {}
 
+struct ScheduledCommandEntry {
+    command: DeviceBoundCommand,
+    trigger_time: u64,
+}
+
+impl Ord for ScheduledCommandEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.trigger_time.cmp(&other.trigger_time).reverse()
+    }
+}
+
+impl PartialOrd for ScheduledCommandEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.trigger_time.cmp(&other.trigger_time).reverse())
+    }
+}
+
+impl PartialEq for ScheduledCommandEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.trigger_time.eq(&other.trigger_time)
+    }
+}
+
+impl Eq for ScheduledCommandEntry {}
+
 struct InnerDeviceManager {
     pub(crate) thread: ManuallyDrop<JoinHandle<()>>,
     pub(crate) sender: ManuallyDrop<Sender<DeviceBoundCommand>>,
@@ -73,8 +100,12 @@ struct InnerDeviceManager {
 
     pub(crate) device_valid: bool,
     pub(crate) receiver_valid: bool,
+    pub(crate) decoder_valid: bool,
     pub(crate) refreshing_devices: bool,
     pub(crate) data_requests_in_flight: usize,
+
+    pub(crate) start_time: Instant,
+    pub(crate) scheduled_commands: BinaryHeap<ScheduledCommandEntry>,
 }
 
 impl InnerDeviceManager {
@@ -106,46 +137,115 @@ impl InnerDeviceManager {
 
             device_valid: false,
             receiver_valid: false,
+            decoder_valid: false,
             refreshing_devices: false,
             data_requests_in_flight: 0,
+
+            start_time: Instant::now(),
+            scheduled_commands: BinaryHeap::new(),
         }
     }
-    fn send_command(&mut self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
+    fn check_state_by_command(&self, command: &DeviceBoundCommand) -> Result<(), DeviceError> {
+        macro_rules! check_state {
+            ($cond:expr) => {
+                if !$cond {
+                    return Err(DeviceError::BadState);
+                }
+            };
+        }
+
         match command {
             DeviceBoundCommand::DestroyDevice => {
-                if self.device_valid {
-                    self.device_valid = false;
-                    self.receiver_valid = false;
-                } else {
-                    return Err(DeviceError::BadState);
-                }
+                check_state!(self.device_valid);
             }
             DeviceBoundCommand::CreateDevice { .. } => {
-                if self.device_valid {
-                    return Err(DeviceError::BadState);
-                } else {
-                    self.device_valid = true;
-                }
+                check_state!(!self.device_valid);
             }
+            DeviceBoundCommand::RefreshDevices { .. } => {}
+            DeviceBoundCommand::SetReceiver(_) => {
+                check_state!(self.device_valid);
+            }
+            DeviceBoundCommand::RequestData { .. } => {
+                check_state!(self.device_valid);
+                check_state!(self.receiver_valid);
+            }
+            DeviceBoundCommand::SetDecoder { .. } => {
+                check_state!(self.device_valid);
+                check_state!(self.receiver_valid);
+            }
+        }
+
+        Ok(())
+    }
+    fn modify_state_by_command(&mut self, command: &DeviceBoundCommand) {
+        match command {
+            DeviceBoundCommand::DestroyDevice => {
+                self.device_valid = false;
+                self.receiver_valid = false;
+                self.decoder_valid = false;
+            }
+            DeviceBoundCommand::CreateDevice { .. } => self.device_valid = true,
             DeviceBoundCommand::RequestData { .. } => self.data_requests_in_flight += 1,
             DeviceBoundCommand::RefreshDevices { .. } => self.refreshing_devices = true,
             DeviceBoundCommand::SetReceiver(_) => self.receiver_valid = true,
-            _ => {}
+            DeviceBoundCommand::SetDecoder { .. } => self.decoder_valid = true,
         }
+    }
+    fn modify_state_by_received_event(&mut self, event: &GuiBoundEvent) {
+        match event {
+            // this event is not sent by the device
+            GuiBoundEvent::WorkerReset => unreachable!(),
+            GuiBoundEvent::DeviceCreated { .. } => self.device_valid = true,
+            GuiBoundEvent::DeviceDestroyed => self.device_valid = false,
+            GuiBoundEvent::RefreshedDevices { .. } => self.refreshing_devices = false,
+            GuiBoundEvent::DataReady { .. } => self.data_requests_in_flight -= 1,
+            GuiBoundEvent::Error(_) => {}
+            GuiBoundEvent::DecodedChars { .. } => {}
+        }
+    }
+    /// Returns the earliest time in ms for a next command to send
+    fn poll_scheduled_commands(&mut self) -> u64 {
+        let current = self.start_time.elapsed().as_millis() as u64;
+        while let Some(next) = self.scheduled_commands.peek() {
+            if next.trigger_time < current {
+                let command = self.scheduled_commands.pop().unwrap().command;
+
+                match self.send_command(command) {
+                    Ok(_) => {}
+                    // only a debug as this is not necessarily an error, this can happen if the device was closed while a RequestData was scheduled
+                    Err(_) => {
+                        log::debug!("Scheduled command tried to send at invalid worker state.")
+                    }
+                }
+            } else {
+                return next.trigger_time - current;
+            }
+        }
+
+        // currently nothing is scheduled, default delay of 5 ms, this technically limits the lowest delay that can be expected to 5 ms since
+        // this function needs to be called to process any commands that were enqueued in the meantime, this is fine for me
+        return 5;
+    }
+    fn send_command(&mut self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
+        self.check_state_by_command(&command)?;
+        self.modify_state_by_command(&command);
 
         self.sender
             .send(command)
             .map_err(|_| DeviceError::WorkerPoisoned)
     }
+    fn schedule_command(&mut self, command: DeviceBoundCommand, delay_ms: u64) {
+        let trigger_time = self.start_time.elapsed().as_millis() as u64 + delay_ms;
+        self.scheduled_commands.push(ScheduledCommandEntry {
+            command,
+            trigger_time,
+        });
+    }
     fn try_receive(&mut self) -> Result<Option<GuiBoundEvent>, WorkerPoisoned> {
         let event = self.receiver.try_recv();
 
         if let Ok(event) = event.as_ref() {
-            match event {
-                GuiBoundEvent::RefreshedDevices { .. } => self.refreshing_devices = false,
-                GuiBoundEvent::DataReady { .. } => self.data_requests_in_flight -= 1,
-                _ => (),
-            }
+            self.modify_state_by_received_event(event);
         }
 
         match event {
@@ -191,6 +291,12 @@ impl DeviceManager {
     }
     pub fn send_command(&self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
         self.0.borrow_mut().send_command(command)
+    }
+    pub fn poll_scheduled_commands(&self) -> u64 {
+        self.0.borrow_mut().poll_scheduled_commands()
+    }
+    pub fn schedule_command(&self, command: DeviceBoundCommand, delay_ms: u64) {
+        self.0.borrow_mut().schedule_command(command, delay_ms)
     }
     pub fn try_receive(&self) -> Result<Option<GuiBoundEvent>, WorkerPoisoned> {
         self.0.borrow_mut().try_receive()

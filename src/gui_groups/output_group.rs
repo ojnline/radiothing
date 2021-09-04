@@ -4,7 +4,7 @@ use std::{ops::Range, rc::Rc};
 
 use crate::gui_groups::handle_send_result;
 use crate::worker::worker::{DeviceBoundCommand, GuiBoundEvent};
-use crate::worker::worker_manager::{DeviceManager};
+use crate::worker::worker_manager::DeviceManager;
 use crate::{FftData, DATA_REQUESTS_IN_FLIGHT, SAMPLE_COUNT};
 
 use qt_charts::{
@@ -32,6 +32,8 @@ struct SingleSeriesGraph {
     y_scale: Cell<f32>,
     smoothed_y_scale: Cell<f32>,
 }
+
+const REQUEST_DATA_INTERVAL_MS: u64 = 16;
 
 impl SingleSeriesGraph {
     unsafe fn new(
@@ -321,6 +323,7 @@ impl OutputGroup {
             }
             GuiBoundEvent::DataReady { data } => {
                 if !(self.device.get_receiver_valid() && self.run_state.get()) {
+                    println!("Lost");
                     return;
                 }
 
@@ -331,9 +334,9 @@ impl OutputGroup {
                 self.spectrum.update_series(spectrum, true, 0.9, 0.2);
 
                 match event.take().unwrap() {
-                    GuiBoundEvent::DataReady { data } => handle_send_result(
-                        self.device
-                            .send_command(DeviceBoundCommand::RequestData { data }),
+                    GuiBoundEvent::DataReady { data } => self.device.schedule_command(
+                        DeviceBoundCommand::RequestData { data },
+                        REQUEST_DATA_INTERVAL_MS,
                     ),
                     _ => unreachable!(),
                 };

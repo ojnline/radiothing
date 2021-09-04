@@ -3,6 +3,9 @@ name = "radiothing-qt"
 version = "0.1.0"
 edition = "2018"
 
+[profile.release]
+panic = "abort"
+
 [dependencies]
 soapysdr = "0.3.0"
 qt_widgets = "0.5.0"

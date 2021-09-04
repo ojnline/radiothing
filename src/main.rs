@@ -13,7 +13,7 @@ use qt_widgets::{qt_core::QBox, QApplication, QHBoxLayout, QVBoxLayout, QWidget}
 
 use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftNum, FftPlanner};
 use worker::worker::GuiBoundEvent;
-use worker::worker_manager::{DeviceManager};
+use worker::worker_manager::DeviceManager;
 
 pub mod app_settings;
 pub mod decoder;
@@ -24,7 +24,7 @@ pub mod worker;
 
 pub const SAMPLE_COUNT: usize = 256;
 
-pub const DATA_REQUESTS_IN_FLIGHT: usize = 4;
+pub const DATA_REQUESTS_IN_FLIGHT: usize = 1;
 
 #[allow(unused)]
 struct App {
@@ -50,6 +50,26 @@ impl App {
         let device = Rc::new(DeviceManager::new());
 
         let root = QWidget::new_0a();
+
+        // this timer runs the scheduled device command
+        // these exist because it is very useful to ensure that a command is sent at some point but not eventually
+        // at this time only to limit the rate at which the commands are exchanged - the automatic device starting would spam the requests a lot otherwise
+        // and rate of RequestData sending would depend on other events being sent through the channel
+        let timer = QTimer::new_1a(&root);
+        timer.set_interval(5);
+        timer.set_single_shot(false);
+        let timer_ptr = timer.as_ptr();
+        let d = device.clone();
+        timer
+            .timeout()
+            .connect(&SlotNoArgs::new(timer_ptr, move || {
+                let next = d.poll_scheduled_commands();
+                // the timer gets the how long it will take for the next earliest command to be "ready"
+                // and then sets it as its interval
+                timer.set_interval(next as i32);
+            }));
+        timer_ptr.start_0a();
+
         let h_layout = QHBoxLayout::new_1a(&root);
 
         // LEFT
@@ -97,7 +117,9 @@ impl App {
             save_path,
         }
     }
-    unsafe fn handle_event(&self, mut event: &mut Option<GuiBoundEvent>) {
+    unsafe fn handle_event(&self, mut event: GuiBoundEvent) {
+        let mut event = Some(event);
+
         macro_rules! chain_handle_events {
             ($event:ident, $($handler:expr),+) => {
                 $(
@@ -113,8 +135,8 @@ impl App {
     unsafe fn reset_worker(&self) {
         self.device.reset();
 
-        let mut event = Some(GuiBoundEvent::WorkerReset);
-        self.handle_event(&mut event);
+        let event = GuiBoundEvent::WorkerReset;
+        self.handle_event(event);
     }
     unsafe fn collect_settings(&self) -> AppSettings {
         let mut settings = DEFAULT_SETTINGS;
@@ -222,27 +244,37 @@ fn main() {
         keep_alive_outside_event_event_loop = Some(app.clone());
 
         let timer = QTimer::new_0a();
-        timer.set_interval(100);
+        timer.set_interval(16);
 
         let a = app.clone();
         timer.timeout().connect(&SlotNoArgs::new(&timer, move || {
-            let event = a.device.try_receive();
+            let start = std::time::Instant::now();
+            loop {
+                let event = a.device.try_receive();
 
-            match event {
-                Ok(Some(GuiBoundEvent::Error(e))) => {
-                    log::error!("Device encountered an error: {}", e);
-                    a.device.set_receive_enabled(false);
-                    a.output_group.set_run(false);
-                }
-                Ok(mut event) => {
-                    a.handle_event(&mut event);
-                }
-                Err(_) => {
-                    log::error!("The receiver worker thread has panicked, resetting worker");
+                match event {
+                    Ok(Some(GuiBoundEvent::Error(e))) => {
+                        log::error!("Device encountered an error: {}", e);
+                        a.device.set_receive_enabled(false);
+                        a.output_group.set_run(false);
+                    }
+                    Ok(Some(event)) => {
+                        a.handle_event(event);
+                    }
+                    Err(_) => {
+                        log::error!("The receiver worker thread has panicked, resetting worker");
 
-                    a.reset_worker();
-                    a.device.set_receive_enabled(false);
-                    a.output_group.set_run(false);
+                        a.reset_worker();
+                        a.device.set_receive_enabled(false);
+                        a.output_group.set_run(false);
+                    }
+                    // break if all the queued messages have been processed
+                    Ok(None) => break,
+                }
+
+                // break if processing took too long
+                if start.elapsed() > std::time::Duration::from_millis(5) {
+                    break;
                 }
             }
         }));
