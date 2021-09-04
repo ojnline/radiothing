@@ -12,8 +12,11 @@ use qt_charts::qt_core::{QTimer, SlotNoArgs};
 use qt_widgets::{qt_core::QBox, QApplication, QHBoxLayout, QVBoxLayout, QWidget};
 
 use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftNum, FftPlanner};
+use soapysdr::ErrorCode;
 use worker::worker::GuiBoundEvent;
 use worker::worker_manager::DeviceManager;
+
+use crate::gui_groups::handle_send_result;
 
 pub mod app_settings;
 pub mod decoder;
@@ -247,9 +250,31 @@ fn main() {
 
                 match event {
                     Ok(Some(GuiBoundEvent::Error(e))) => {
-                        log::error!("Device encountered an error: {}", e);
-                        a.device.set_receive_enabled(false);
-                        a.output_group.set_run(false);
+                        match e.code {
+                            ErrorCode::NotSupported | ErrorCode::Timeout if e.message == "Lost" => {
+                                log::error!(
+                                    "Device encountered a fatal error: {:?}: '{}'",
+                                    e.code,
+                                    e.message
+                                );
+                                a.device.set_receive_enabled(false);
+                                a.output_group.set_run(false);
+                                handle_send_result(a.device.send_command(
+                                    worker::worker::DeviceBoundCommand::DestroyDevice,
+                                ));
+                            }
+
+                            // non-fatal error, continue
+                            _ => {
+                                log::error!(
+                                    "Device encountered an error: {:?}: '{}'",
+                                    e.code,
+                                    e.message
+                                );
+                                a.device.set_receive_enabled(false);
+                                a.output_group.set_run(false);
+                            }
+                        }
                     }
                     Ok(Some(event)) => {
                         a.handle_event(event);
