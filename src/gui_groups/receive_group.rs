@@ -1,6 +1,6 @@
 use std::{
     borrow::Borrow,
-    cell::{Cell, RefCell},
+    cell::{Cell, Ref, RefCell},
     rc::Rc,
 };
 
@@ -42,7 +42,6 @@ pub struct ReceiveGroup {
     form_layout: QBox<QFormLayout>,
 
     value_ranges: RefCell<Option<ValueRanges>>,
-    current_values: Cell<Option<ReceiverState>>,
     device: Rc<DeviceManager>,
     settings: Rc<AppSettings>,
 }
@@ -115,7 +114,6 @@ impl ReceiveGroup {
             form_layout: form,
 
             value_ranges: RefCell::new(None),
-            current_values: Cell::new(None),
             device,
             settings,
         });
@@ -161,13 +159,8 @@ impl ReceiveGroup {
         // nothing changed, this is possible because this function is called on editing_finished signal from qt
         // this signal gets sent if for example you click into the value field of a spinbox and then focus something else
         // without actually changing anything
-
-        // Cell is repr(transparent) so it is valid to compare it with a value of the inner Type
-        // Cell<Option<T>> -> *const Option<T> -> &Option<T> -> Option<&T>
-        if Some(&state) == (&*self.current_values.as_ptr()).as_ref() && force == false {
+        if self.device.get_receiver_state().as_ref() == Some(&state) && force != true {
             return;
-        } else {
-            self.current_values.set(Some(state.clone()));
         }
 
         handle_send_result(

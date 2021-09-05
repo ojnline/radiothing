@@ -81,61 +81,45 @@ impl FirFilter {
     /// The expected use for this is to save `side_len` elements the end of the src memory at (or less if decimation resulted in a weird number remaining)
     /// and then copy it to the beggining when new data is available.
     ///
-    /// returns the number of elements that should be safed at the end, in general the value returned will be at most `(filter_len - 1) / 2`
-    pub unsafe fn apply<T: Num + NumOps<f32> + Clone>(
+    /// returns the number of elements that should be saved at the end, in general the value returned will be `len % filter.len()`
+    pub unsafe fn apply<T: Num + NumOps<f32> + Copy>(
         &self,
         src: *const T,
         dst: *mut T,
         len: usize,
         decimation: u32,
     ) -> usize {
-        let filter_len = self.taps.len();
+        let taps = self.taps.len();
 
-        // filter len must be odd, this is ensured elsewhere
-        debug_assert!(filter_len % 2 == 1);
+        let end = src.add(len);
 
-        let side_len = (filter_len - 1) / 2;
+        let mut src = src;
+        // each iteration touches ..taps so in each iteration
+        // src + taps <= src + len   # subtract taps
+        // src <= src + len - taps   # right side is constant which is good
+        let src_end = src.offset(len as isize - taps as isize);
+        let mut dst = dst;
 
-        // example situation - src_len 10, start_offset 5, filter_len 5, side_len 2
-        //
-        // xx|xxxx..
-        // <-|->
-        //
-        // accesses +-2 around itself
-        // then shifts to the right by `decimation`
-
-        let available = len - side_len;
-
-        // assert!((available - start_offset) / decimation <= dst.len()); // if dst had a checkable len
-
-        let mut src_i = side_len;
-        let mut dst_i = 0;
-
-        while src_i < available {
+        while src <= src_end {
             let mut acc = T::zero();
 
-            let sidelen_start = src.add(src_i - side_len);
-            for j in 0..filter_len {
-                // i >= start_offset >= side_len
-                // i < available < src.len()
-                let src = (*sidelen_start.add(j)).clone();
-                acc = acc + src * self.taps[j];
+            // this just computes the scalar product (dot product) of a part of the input data and the filter
+            for tap_i in 0..taps {
+                let tap = *src.add(tap_i);
+                acc = acc + tap * self.taps[tap_i];
             }
 
-            // dst_i < available <= dst.len()
-            *dst.add(dst_i) = acc;
+            *dst = acc;
 
-            src_i += decimation as usize;
-            dst_i += 1;
+            src = src.add(decimation as usize);
+            dst = dst.add(1);
         }
 
-        // imaaaagine decimation 10, side_len 5              <----|---->
-        // xxxxx|xxxxxxxxx|xxxxxxxxx|xxxxxxxxx|xxxxxxxxx|xxxxxx...|.........|
-        //                                                   ^^--------> it is neccessary to save just the last two elements as the next "central sample" would reach 5 samples
-        //                                                               around itself and so from this batch it is concerned only about the last sample
+        // imaaaagine decimation 10, taps 5
+        // xxxxxxxxx|xxxxxxxxx|xxxxxxxxx|xxxxxxxxx|xxxxxxxxx|xx.......|
+        // -----     -----     -----     -----     -----     ^^---  it is neccessary to save just the last two elements
 
-        // this looks complicated but it's just ugly due to the loads of isize casts to handle negative usize numbers correctly
-        (len as isize - (src_i - side_len) as isize).max(0) as usize
+        end.offset_from(src).max(0) as usize
     }
     pub fn len(&self) -> usize {
         self.taps.len()

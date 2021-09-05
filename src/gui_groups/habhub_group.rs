@@ -11,15 +11,6 @@ use qt_widgets::{
     QCheckBox, QFormLayout, QGroupBox, QLineEdit,
 };
 
-pub enum Mode {
-    Baudot {
-        baudrate: f32,
-        stop_bits: f32,
-        decimation: usize,
-        freq_shift: f32,
-    },
-}
-
 #[allow(unused)]
 pub struct HabhubGroup {
     group: QBox<QGroupBox>,

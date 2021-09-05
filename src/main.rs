@@ -156,6 +156,8 @@ pub struct FftData<T: FftNum> {
     input: Box<[Complex<T>]>,
     output: Box<[Complex<T>]>,
     scratch: Box<[Complex<T>]>,
+
+    meta_samplerate: f64,
 }
 
 impl<T: FftNum> FftData<T> {
@@ -173,6 +175,8 @@ impl<T: FftNum> FftData<T> {
             input,
             output,
             scratch,
+
+            meta_samplerate: 0.0,
         }
     }
     pub fn get_input(&self) -> &[Complex<T>] {
@@ -184,13 +188,17 @@ impl<T: FftNum> FftData<T> {
     pub fn get_output(&self) -> &[Complex<T>] {
         &self.output
     }
+    pub fn get_samplerate(&self) -> f64 {
+        self.meta_samplerate
+    }
 
-    pub fn process(&mut self) {
+    pub fn process(&mut self, samplerate: f64) {
         self.fft.process_outofplace_with_scratch(
             &mut self.input,
             &mut self.output,
             &mut self.scratch,
         );
+        self.meta_samplerate = samplerate;
     }
 }
 
@@ -205,6 +213,7 @@ impl<T: FftNum> Clone for FftData<T> {
             input,
             output,
             scratch,
+            meta_samplerate: self.meta_samplerate,
         }
     }
 }
@@ -263,7 +272,9 @@ fn main() {
                                     worker::worker::DeviceBoundCommand::DestroyDevice,
                                 ));
                             }
-
+                            ErrorCode::Timeout => {
+                                log::debug!("Timeout");
+                            }
                             // non-fatal error, continue
                             _ => {
                                 log::error!(

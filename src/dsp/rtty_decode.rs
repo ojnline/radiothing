@@ -7,6 +7,7 @@ pub unsafe fn decode<T: Num + Float + Copy>(
     samples_len: usize,
     bits: *mut bool,
     bits_offset: usize,
+    stop_bits: f32,
     baudrate: f32,
     samplerate: f32,
     letters: &mut bool,
@@ -47,8 +48,11 @@ where
         prev = cur;
     }
 
-    let samples_per_symbol = (samplerate / baudrate) as usize;
-    let half_samples_per_symbol = samples_per_symbol / 2;
+    let samples_per_symbol_f = samplerate / baudrate;
+
+    let samples_per_symbol = samples_per_symbol_f as usize;
+    let half_samples_per_symbol = (samples_per_symbol_f / 2.0) as usize;
+    let samples_per_stop_bit = (samples_per_symbol_f * stop_bits) as usize;
 
     let mut string = String::new();
 
@@ -76,29 +80,39 @@ where
             cursor = cursor.add(1);
         }
 
-        let stopbit = cursor.add(6 * samples_per_symbol + half_samples_per_symbol);
-        if stopbit > bits_end {
+        let mut stopbit = cursor.add(6 * samples_per_symbol);
+        if stopbit.add(samples_per_stop_bit) > bits_end {
             break 'decode_chars;
         }
 
         // 1 xxxxx 0..
         // ^ - found rising edge, now look at the stop bit if it really is zero, otherwise try again
-        if *stopbit == false {
-            // wrong
-            // consume bits until a falling edge is found so that the rising edge loop isn't immediatelly trigerred
-            // then restart the loop
-            loop {
-                if cursor == bits_end {
-                    break 'decode_chars;
-                }
-
-                if *cursor == false {
-                    continue 'decode_chars;
-                }
-
-                cursor = cursor.add(1);
-            }
+        let mut stopbit_wrong = false;
+        for _ in 0..samples_per_stop_bit {
+            stopbit_wrong |= *stopbit == true;
+            stopbit = stopbit.add(1);
         }
+
+        if stopbit_wrong {
+            cursor = cursor.add(6 * samples_per_symbol + samples_per_stop_bit);
+            continue 'decode_chars;
+        }
+        // if *stopbit == true {
+        //     // wrong
+        //     // consume bits until a falling edge is found so that the rising edge loop isn't immediatelly trigerred
+        //     // then restart the loop
+        //     loop {
+        //         if cursor == bits_end {
+        //             break 'decode_chars;
+        //         }
+
+        //         if *cursor == false {
+        //             continue 'decode_chars;
+        //         }
+
+        //         cursor = cursor.add(1);
+        //     }
+        // }
 
         // 1 xxxxx 0
         // --^ offset into the middle of the character pulse

@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
 use std::cell::Cell;
+use std::io::Write;
 use std::{ops::Range, rc::Rc};
 
 use crate::gui_groups::handle_send_result;
@@ -29,11 +30,13 @@ struct SingleSeriesGraph {
 
     x_axis: QBox<QValueAxis>,
     y_axis: QBox<QValueAxis>,
-    y_scale: Cell<f32>,
-    smoothed_y_scale: Cell<f32>,
+    y_scale_min: Cell<f32>,
+    y_scale_max: Cell<f32>,
+    smoothed_y_scale_min: Cell<f32>,
+    smoothed_y_scale_max: Cell<f32>,
 }
 
-const REQUEST_DATA_INTERVAL_MS: u64 = 16;
+const REQUEST_DATA_INTERVAL_MS: u64 = 150;
 
 impl SingleSeriesGraph {
     unsafe fn new(
@@ -104,8 +107,10 @@ impl SingleSeriesGraph {
 
             x_axis,
             y_axis,
-            y_scale: Cell::new(y.abs() as f32),
-            smoothed_y_scale: Cell::new(y.abs() as f32),
+            y_scale_min: Cell::new(-y as f32),
+            y_scale_max: Cell::new(y as f32),
+            smoothed_y_scale_min: Cell::new(-y as f32),
+            smoothed_y_scale_max: Cell::new(y as f32),
         }
     }
 
@@ -114,10 +119,12 @@ impl SingleSeriesGraph {
     //  the imaginary part is discarded
 
     // the safety of this is dubious at best but should work
+    #[rustfmt::skip]
     pub unsafe fn update_series(
         &self,
         y_samples: &[Complex32],
         fit_y: bool,
+        y_symmetric: bool,
         smoothing_factor: f32,
         proportional_margin: f32,
     ) {
@@ -128,27 +135,48 @@ impl SingleSeriesGraph {
         self.view.set_updates_enabled(false);
 
         if fit_y {
-            let mut abs_max = 0.0f32;
+            let mut min = 0.0f32;
+            let mut max = 0.0f32;
             for s in y_samples {
-                abs_max = abs_max.max(s.re.abs());
+                min = min.min(s.re);
+                max = max.max(s.re);
             }
 
-            abs_max += abs_max * proportional_margin;
-            let new_y_scale =
-                self.smoothed_y_scale.get() * smoothing_factor + abs_max * (1.0 - smoothing_factor);
+            if y_symmetric {
+                let abs_max = min.abs().max(max);
+                min = -abs_max;
+                max = abs_max;
+            }
 
-            self.smoothed_y_scale.set(new_y_scale);
+            min *= 1.0 + proportional_margin;
+            max *= 1.0 + proportional_margin;
 
             // the scale lowers to match the smoothed scale only if it is off by at least 20% of the current scale
             const MIN_PROPORTIONAL_DELTA: f32 = 0.2;
+            {
+                // min
+                let new_y_scale_min =
+                    self.smoothed_y_scale_min.get() * smoothing_factor + min * (1.0 - smoothing_factor);
+                self.smoothed_y_scale_min.set(new_y_scale_min);
 
-            let y_scale = self.y_scale.get();
-            // set the new range if it is bigger than the previous one or if it is smaller by at least a proportional delta
-            if new_y_scale > y_scale || new_y_scale / y_scale < (1.0 - MIN_PROPORTIONAL_DELTA) {
-                self.y_scale.set(new_y_scale);
+                // max
+                let new_y_scale_max =
+                    self.smoothed_y_scale_max.get() * smoothing_factor + max * (1.0 - smoothing_factor);
+                self.smoothed_y_scale_max.set(new_y_scale_max);
 
-                self.y_axis
-                    .set_range(-new_y_scale as f64, new_y_scale as f64);
+                let y_scale_min = self.y_scale_min.get();
+                let y_scale_max = self.y_scale_max.get();
+
+                // set the new range if it is bigger than the previous one or if it is smaller by at least a proportional delta
+                if (new_y_scale_min < y_scale_min || new_y_scale_min / y_scale_min < (1.0 - MIN_PROPORTIONAL_DELTA))
+                || (new_y_scale_max > y_scale_max || new_y_scale_max / y_scale_max < (1.0 - MIN_PROPORTIONAL_DELTA))
+                {
+                    self.y_scale_min.set(new_y_scale_min);
+                    self.y_scale_max.set(new_y_scale_max);
+
+                    self.y_axis
+                        .set_range(new_y_scale_min as f64, new_y_scale_max as f64);
+                }
             }
         }
 
@@ -194,8 +222,8 @@ impl SingleSeriesGraph {
         let d_x = 1.0 / (y_samples.len() as f64);
         let mut x = 0.0;
 
-        for (i, y) in y_samples.iter().enumerate() {
-            let y = y.re as f64;
+        for (i, c) in y_samples.iter().enumerate() {
+            let y = c.re as f64;
 
             (x0.offset(i as isize * pointf_stride) as *mut ::std::os::raw::c_double).write(x);
             (y0.offset(i as isize * pointf_stride) as *mut ::std::os::raw::c_double).write(y);
@@ -236,7 +264,7 @@ impl OutputGroup {
 
         // the axis ranges are meaningless because they are overridden after the correct signals are bound in init()
         let spectrum =
-            SingleSeriesGraph::new(0.0..1.0, 0.1, "Hz", "", "Spectrum", true, false, true);
+            SingleSeriesGraph::new(0.0..1.0, 0.1, "MHz", "", "Spectrum", true, false, true);
         grid.add_widget_3a(&spectrum.view, 0, 1);
 
         let text_edit = QTextEdit::new();
@@ -319,19 +347,41 @@ impl OutputGroup {
                 }
             }
             GuiBoundEvent::DecodedChars { data } => {
-                // self.text_edit.insert_plain_text(&qs(data.as_str()));
+                let stdout = std::io::stdout();
+                let mut lock = stdout.lock();
+
+                lock.write_all(data.as_bytes()).unwrap();
+
+                self.text_edit.insert_plain_text(&qs(data.as_str()));
             }
             GuiBoundEvent::DataReady { data } => {
                 if !(self.device.get_receiver_valid() && self.run_state.get()) {
-                    println!("Lost");
                     return;
                 }
 
                 let signal = data.get_input();
                 let spectrum = data.get_output();
 
-                self.signal.update_series(signal, true, 0.9, 0.2);
-                self.spectrum.update_series(spectrum, true, 0.9, 0.2);
+                self.signal.update_series(signal, true, true, 0.9, 0.2);
+                self.spectrum.update_series(spectrum, true, false, 0.9, 0.2);
+
+                if let Some(state) = self.device.get_receiver_state() {
+                    // todo decimate the signal first and take that into account
+                    let samplerate = data.get_samplerate();
+                    let n = signal.len() as f64;
+
+                    // ms
+                    self.signal
+                        .x_axis
+                        .set_range(0.0, samplerate.recip() * n * 1000.0);
+
+                    // MHz
+                    let offset = state.frequency / 1000_000.0;
+                    let samplerate = samplerate / 1000_000.0;
+                    self.spectrum
+                        .x_axis
+                        .set_range(offset - samplerate / 2.0, offset + samplerate / 2.0);
+                }
 
                 match event.take().unwrap() {
                     GuiBoundEvent::DataReady { data } => self.device.schedule_command(

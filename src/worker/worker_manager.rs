@@ -104,6 +104,8 @@ struct InnerDeviceManager {
     pub(crate) refreshing_devices: bool,
     pub(crate) data_requests_in_flight: usize,
 
+    pub(crate) receiver_state: Option<ReceiverState>,
+
     pub(crate) start_time: Instant,
     pub(crate) scheduled_commands: BinaryHeap<ScheduledCommandEntry>,
 }
@@ -140,6 +142,8 @@ impl InnerDeviceManager {
             decoder_valid: false,
             refreshing_devices: false,
             data_requests_in_flight: 0,
+
+            receiver_state: None,
 
             start_time: Instant::now(),
             scheduled_commands: BinaryHeap::new(),
@@ -183,11 +187,15 @@ impl InnerDeviceManager {
                 self.device_valid = false;
                 self.receiver_valid = false;
                 self.decoder_valid = false;
+                self.receiver_state = None;
             }
             DeviceBoundCommand::CreateDevice { .. } => self.device_valid = true,
             DeviceBoundCommand::RequestData { .. } => self.data_requests_in_flight += 1,
             DeviceBoundCommand::RefreshDevices { .. } => self.refreshing_devices = true,
-            DeviceBoundCommand::SetReceiver(_) => self.receiver_valid = true,
+            DeviceBoundCommand::SetReceiver(state) => {
+                self.receiver_valid = true;
+                self.receiver_state = Some(state.clone());
+            }
             DeviceBoundCommand::SetDecoder { .. } => self.decoder_valid = true,
         }
     }
@@ -195,8 +203,8 @@ impl InnerDeviceManager {
         match event {
             // this event is not sent by the device
             GuiBoundEvent::WorkerReset => unreachable!(),
-            GuiBoundEvent::DeviceCreated { .. } => self.device_valid = true,
-            GuiBoundEvent::DeviceDestroyed => self.device_valid = false,
+            GuiBoundEvent::DeviceCreated { .. } => {}
+            GuiBoundEvent::DeviceDestroyed => {}
             GuiBoundEvent::RefreshedDevices { .. } => self.refreshing_devices = false,
             GuiBoundEvent::DataReady { .. } => self.data_requests_in_flight -= 1,
             GuiBoundEvent::Error(_) => {}
@@ -288,6 +296,9 @@ impl DeviceManager {
     }
     pub fn get_data_requests_in_flight(&self) -> usize {
         self.0.borrow().data_requests_in_flight
+    }
+    pub fn get_receiver_state(&self) -> Option<ReceiverState> {
+        self.0.borrow().receiver_state.clone()
     }
     pub fn send_command(&self, command: DeviceBoundCommand) -> Result<(), DeviceError> {
         self.0.borrow_mut().send_command(command)
