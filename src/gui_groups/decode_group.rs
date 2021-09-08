@@ -32,7 +32,7 @@ enum ModeConfig {
 }
 
 impl ModeConfig {
-    unsafe fn new_from_index(index: i32) -> (Self, QBox<QWidget>) {
+    unsafe fn new_from_index(index: usize, settings: &AppSettings) -> (Self, QBox<QWidget>) {
         match index {
             0 => (Self::None, QWidget::new_0a()),
             1 => {
@@ -48,6 +48,8 @@ impl ModeConfig {
 
                 let baudrate = QDoubleSpinBox::new_0a();
                 baudrate.set_suffix(&qs(" Bd"));
+                baudrate.set_range(0.0, 1000.0);
+                // settings.baudratebaudrate.set_value()
                 form.add_row_q_string_q_widget(&qs("Baudrate"), &baudrate);
 
                 let stop_bits = QDoubleSpinBox::new_0a();
@@ -87,6 +89,9 @@ impl ModeConfig {
             )),
         }
     }
+    fn populate_settings(&self, settings: &mut AppSettings) {
+
+    }
 }
 
 #[allow(unused)]
@@ -97,7 +102,7 @@ pub struct DecodeGroup {
     mode_select: QBox<QComboBox>,
     mode_widget: RefCell<QBox<QWidget>>,
     mode_config: RefCell<ModeConfig>,
-    apply: QBox<QPushButton>,
+    apply_btn: QBox<QPushButton>,
 
     device: Rc<DeviceManager>,
     settings: Rc<AppSettings>,
@@ -125,7 +130,9 @@ impl DecodeGroup {
 
         form.add_row_q_string_q_widget(&qs("Mode"), &mode_select);
 
-        let (mode_config, mode_widget) = ModeConfig::new_from_index(0);
+        let index = MODES.iter().position(|name| *name == settings.decoder.as_str()).unwrap_or(0);
+
+        let (mode_config, mode_widget) = ModeConfig::new_from_index(index);
 
         v_layout.add_widget(&mode_widget);
 
@@ -142,8 +149,10 @@ impl DecodeGroup {
             mode_select,
             mode_config: RefCell::new(mode_config),
             mode_widget: RefCell::new(mode_widget),
-            apply,
+            apply_btn: apply,
         });
+        
+        s.apply_btn.set_enabled(false);
 
         s.init();
 
@@ -156,7 +165,12 @@ impl DecodeGroup {
                     let command = DeviceBoundCommand::SetDecoder { decoder };
 
                     handle_send_result(self.device.send_command(command));
+
                 }
+                self.apply_btn.set_enabled(true);
+            }
+            GuiBoundEvent::DeviceDestroyed | GuiBoundEvent::WorkerReset => {
+                self.apply_btn.set_enabled(false);
             }
             _ => {}
         };
@@ -164,7 +178,7 @@ impl DecodeGroup {
     unsafe fn init(self: &Rc<Self>) {
         let Self {
             group,
-            apply,
+            apply_btn: apply,
             mode_select,
             ..
         } = &*self.borrow();
@@ -173,7 +187,7 @@ impl DecodeGroup {
         mode_select
             .current_index_changed()
             .connect(&SlotOfInt::new(group, move |i| {
-                let (mode_config, mode_widget) = ModeConfig::new_from_index(i);
+                let (mode_config, mode_widget) = ModeConfig::new_from_index(i as usize);
                 s.v_layout
                     .replace_widget_2a(&*s.mode_widget.borrow(), &mode_widget);
                 s.mode_widget.replace(mode_widget);
@@ -189,5 +203,7 @@ impl DecodeGroup {
             }
         }));
     }
-    pub unsafe fn populate_settings(&self, settings: &mut AppSettings) {}
+    pub unsafe fn populate_settings(&self, settings: &mut AppSettings) {
+        self.mode_config.borrow().populate_settings(settings);
+    }
 }

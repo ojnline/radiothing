@@ -118,7 +118,7 @@ impl ReceiveGroup {
             settings,
         });
 
-        s.group.set_enabled(false);
+        s.apply_btn.set_enabled(false);
         s.init();
 
         (s, ptr)
@@ -180,17 +180,17 @@ impl ReceiveGroup {
             ..
         } = self.borrow();
 
-        let s = self.clone();
-        automatic_update
-            .state_changed()
-            .connect(&SlotOfInt::new(group, move |state| {
-                let enabled = state == CheckState::Unchecked.into() && s.device.get_device_valid();
-                s.apply_btn.set_enabled(enabled);
+        // let s = self.clone();
+        // automatic_update
+        //     .state_changed()
+        //     .connect(&SlotOfInt::new(group, move |state| {
+        //         let enabled = state == CheckState::Unchecked.into() && s.device.get_device_valid();
+        //         s.apply_btn.set_enabled(enabled);
 
-                if state == CheckState::Checked.into() {
-                    s.update_receiver_configuration(false);
-                }
-            }));
+        //         if state == CheckState::Checked.into() {
+        //             s.update_receiver_configuration(false);
+        //         }
+        //     }));
 
         // another extremely bikeshedded (bikeshad?) macro
         macro_rules! setup_values_changed {
@@ -206,7 +206,7 @@ impl ReceiveGroup {
 
                         drop(ranges);
 
-                        if s.automatic_update.is_checked() {
+                        if s.automatic_update.is_checked() && s.device.get_device_valid() {
                             s.update_receiver_configuration(false);
                         }
                     }));
@@ -369,10 +369,10 @@ impl ReceiveGroup {
                 // make sure that the device has "some" receive stream configured, if the values lead to a timeout error or similar, the sample retrieval will be paused
                 self.update_receiver_configuration(true);
 
-                self.group.set_enabled(true);
+                self.apply_btn.set_enabled(true);
             }
-            GuiBoundEvent::DeviceDestroyed => {
-                self.group.set_enabled(false);
+            GuiBoundEvent::DeviceDestroyed | GuiBoundEvent::WorkerReset => {
+                self.apply_btn.set_enabled(false);
             }
             _ => (),
         }

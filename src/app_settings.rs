@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use crate::settings::Settings;
+use crate::{decoder::Decoder, settings::Settings};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AppSettings {
     pub auto_device: bool,
     pub device_filter: String,
@@ -14,6 +14,8 @@ pub struct AppSettings {
     pub gain: f64,
     pub automatic_gain: bool,
     pub automatic_dc_offset: bool,
+
+    pub decoder: String
 }
 
 impl AppSettings {
@@ -70,6 +72,8 @@ pub const DEFAULT_SETTINGS: AppSettings = AppSettings {
     gain: 0.0,
     automatic_gain: false,
     automatic_dc_offset: false,
+
+    decoder: String::new(),
 };
 
 //                      (Settings, Save path)
@@ -189,13 +193,13 @@ Options:
                         ($($field:ident),* $(,)*) => {
                             AppSettings {
                                 $(
-                                    $field: settings.get(stringify!($field)).unwrap(),
+                                    $field: settings.get(stringify!($field)).unwrap_or(DEFAULT_SETTINGS.$field),
                                 )*
                             }
                         }
                     }
 
-                let settings = settings_from_settings! {
+                let deserialized = settings_from_settings! {
                     auto_device,
                     device,
                     device_filter,
@@ -205,9 +209,10 @@ Options:
                     gain,
                     automatic_gain,
                     automatic_dc_offset,
+                    decoder,
                 };
 
-                return (settings, save_path);
+                return (deserialized, save_path);
             }
         } else {
             log::error!("Config file at '{}' is not a file", path.to_string_lossy())

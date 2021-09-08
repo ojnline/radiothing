@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::{ops::Range, rc::Rc};
 
@@ -36,7 +36,7 @@ struct SingleSeriesGraph {
     smoothed_y_scale_max: Cell<f32>,
 }
 
-const REQUEST_DATA_INTERVAL_MS: u64 = 150;
+const REQUEST_DATA_INTERVAL_MS: u64 = 20;
 
 impl SingleSeriesGraph {
     unsafe fn new(
@@ -247,6 +247,8 @@ pub struct OutputGroup {
     spectrum: SingleSeriesGraph,
     text_edit: QBox<QTextEdit>,
 
+    smoothed_spectrum: RefCell<[f32; SAMPLE_COUNT]>,
+
     device: Rc<DeviceManager>,
 }
 
@@ -289,6 +291,8 @@ impl OutputGroup {
             spectrum,
             text_edit,
 
+            smoothed_spectrum: RefCell::new([0.0; SAMPLE_COUNT]),
+
             device,
         });
 
@@ -326,7 +330,7 @@ impl OutputGroup {
         }));
     }
     pub unsafe fn handle_event(&self, event: &mut Option<GuiBoundEvent>) {
-        match event.as_ref().unwrap() {
+        match event.as_mut().unwrap() {
             GuiBoundEvent::DeviceCreated { .. } => {
                 // self.signal.clear();
                 // self.spectrum.clear();
@@ -359,6 +363,23 @@ impl OutputGroup {
                     return;
                 }
 
+                let spectrum = data.get_output_mut();
+                
+                let half = spectrum.len() / 2;
+                // the output of fft is not actually continuous, it is swapped around 0
+                // [0ppppppp|nnnnnnnn]
+                //  DC     N/2
+                // |positive|negative|
+                let (positive, negative) = spectrum.split_at_mut(half);
+                positive.swap_with_slice(negative);
+
+                let smoothed = &mut*self.smoothed_spectrum.borrow_mut();
+
+                // todo make this configurable
+                for i in 0..smoothed.len() {
+                    smoothed[i] = 0.1 * spectrum[i].re + 0.9 * smoothed[i];
+                }
+                
                 let signal = data.get_input();
                 let spectrum = data.get_output();
 

@@ -25,7 +25,7 @@ pub mod gui_groups;
 pub mod settings;
 pub mod worker;
 
-pub const SAMPLE_COUNT: usize = 256;
+pub const SAMPLE_COUNT: usize = 512;
 
 pub const DATA_REQUESTS_IN_FLIGHT: usize = 1;
 
@@ -120,7 +120,7 @@ impl App {
             save_path,
         }
     }
-    unsafe fn handle_event(&self, mut event: GuiBoundEvent) {
+    unsafe fn handle_event(&self, event: GuiBoundEvent) {
         let mut event = Some(event);
 
         macro_rules! chain_handle_events {
@@ -145,6 +145,7 @@ impl App {
         let mut settings = DEFAULT_SETTINGS;
         self.device_group.populate_settings(&mut settings);
         self.receive_group.populate_settings(&mut settings);
+        self.decode_group.populate_settings(&mut settings);
 
         settings
     }
@@ -187,6 +188,9 @@ impl<T: FftNum> FftData<T> {
     }
     pub fn get_output(&self) -> &[Complex<T>] {
         &self.output
+    }
+    pub fn get_output_mut(&mut self) -> &mut [Complex<T>] {
+        &mut self.output
     }
     pub fn get_samplerate(&self) -> f64 {
         self.meta_samplerate
@@ -251,6 +255,9 @@ fn main() {
         let timer = QTimer::new_1a(&app.root);
         timer.set_interval(16);
 
+        let mut consecutive_timeout_count = 0;
+        const MAX_CONSECUTIVE_TIMEOUT_COUNT: u32 = 8;
+
         let a = app.clone();
         timer.timeout().connect(&SlotNoArgs::new(&timer, move || {
             let start = std::time::Instant::now();
@@ -271,9 +278,24 @@ fn main() {
                                 handle_send_result(a.device.send_command(
                                     worker::worker::DeviceBoundCommand::DestroyDevice,
                                 ));
+                                consecutive_timeout_count = 0;
                             }
                             ErrorCode::Timeout => {
-                                log::debug!("Timeout");
+                                consecutive_timeout_count += 1;
+                                
+                                if consecutive_timeout_count == MAX_CONSECUTIVE_TIMEOUT_COUNT {
+                                    log::error!("Device timed out too many times");
+                                    a.device.set_receive_enabled(false);
+                                    a.output_group.set_run(false);
+                                    consecutive_timeout_count = 0;
+
+                                    handle_send_result(a.device.send_command(
+                                        worker::worker::DeviceBoundCommand::DestroyDevice,
+                                    ));
+                                } else {
+                                    log::debug!("Timeout");
+                                }
+                                
                             }
                             // non-fatal error, continue
                             _ => {
@@ -289,6 +311,7 @@ fn main() {
                     }
                     Ok(Some(event)) => {
                         a.handle_event(event);
+                        consecutive_timeout_count = 0;
                     }
                     Err(_) => {
                         log::error!("The receiver worker thread has panicked, resetting worker");
